@@ -1,0 +1,5115 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+use File::Basename;
+use Getopt::Std;
+use List::Util qw[min max];
+use Tie::Array::Packed;
+use Getopt::Long;
+use List::MoreUtils qw/ uniq /;
+use List::Util qw(sum);
+
+## Author: Ke Bi (ke@berkeley.edu)
+## Computational Genomics Resource Laboratory
+## California Institute for Quantitative Biosciences
+## University of California, Berkeley
+## 238 Koshland Hall
+## Berkeley, CA 94720-3102
+
+
+## Version 0.13
+
+## Nov.14, 2014 Version 0.10.0
+## Nov.20, 2014 Version 0.11.1
+## Dec.17, 2014 Version 0.11.2
+## Dec.20, 2014 Version 0.12.0
+## Dec.22, 2014 Version 0.12.1
+## Dec.26, 2014 Version 0.12.2
+## Dec.29, 2014 Version 0.12.3
+## Jan 13, 2015 Version 0.12.4
+## Jan 17, 2015 Version 0.12.5
+## May 12, 2015 Version 0.13.0
+## Aug 23, 2015 Version 0.13.1
+## Aug 29, 2015 Version 0.13.2
+## Sep 2,  2015 Version 0.13.3
+## Sep 24, 2015 Version 0.13.4
+## Oct 1,  2015 Version 0.13.5
+## Jan 15, 2016 Version 0.13.6
+## Mar 18, 2016 Version 0.13.7
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+## Command "cleanPE" use part of the codes from 2-ScrubReads(by Sonal Singhal<sonal.singhal1@gmail.com> and Ke Bi)
+## Data filtering use part of the codes from SNPcleaner (by Tyler Linderoth <tylerp.linderoth@gmail.com>) 
+ 
+
+&main;
+exit;
+
+sub main {
+  &usage if (@ARGV<1);
+  
+  my $command = shift(@ARGV);
+  my %RAD = (cleanPE=>\&cleanPE,cleanSE=>\&cleanSE, clustertest=>\&clustertest, filter=>\&filter, contig=>\&contig, popRad=>\&popRad, phyloRad=>\&phyloRad, phyloRadOut=>\&phyloRadOut, angsd=>\&angsd, demultiplex =>\&demultiplex, preClean=>\&preClean);
+  die("Unknown command \"$command\"\n") if (!defined($RAD{$command}));
+  &{$RAD{$command}};
+}
+
+
+sub usage {
+  die(qq/
+Usage: RADTools <command> [<arguments>]\n
+
+Command: 
+
+preClean:       Reformatting raw fastq reads for "demultiplex"
+
+demultiplex:    De-multiplexing sequence reads (from folder pre-clean) for "filter"
+
+filter:         Initial filtering: non-RAD tags for "cleanPE" or "cleanSE"
+
+cleanPE:        Clean up PE raw data, which includes trimming for quality,
+                low complexity, removing adapters, merging overlapping reads, 
+                reads sourced from contamination. 
+
+cleanSE:        Clean up SE raw data, which includes trimming for quality,
+                low complexity, removing adapters, reads sourced from contamination. 
+
+clustertest:    Test various with-individual and between-individual clustering threshold   
+
+contig:         Re-construct RAD loci for each individual. 
+
+popRad:         Concatenate RADs from all samples to make a reference, alignment using 
+                Bowtie2, indel-realignment using GATK, SNP filtering
+
+angsd:          Genotype calling, SNP calling and allele frequency estimate using ANGSD 
+   
+phyloRad:       Find and align orthologous RAD from all samples  
+
+phyloRadOut:    Generate input files for various phylogenetic analyses   
+
+
+                            ddRAD PE                                              
+#############################################################################################                                      
+#   For population application:                                                             #  
+#                                                                                           #  
+#   preClean -> demultiplex -> filter -> cleanPE ->  contig ->  popRad -> angsd             #    
+#                                                                                           #       
+#   For phylogenetic application:                                                           #
+#                                                                                           #
+#   preClean -> demultiplex -> filter -> cleanPE ->  contig -> phyloRad -> phyloRadOut      # 
+#############################################################################################     
+
+
+                        sdRAD or ddRAD SE                                              
+#############################################################################################                                      
+#   For population application:                                                             #  
+#                                                                                           #  
+#   preClean -> demultiplex -> filter -> cleanSE ->  contig ->  popRad -> angsd             #    
+#                                                                                           #
+#   For phylogenetic application:                                                           # 
+#                                                                                           #
+#   preClean -> demultiplex -> filter -> cleanSE ->  contig -> phyloRad -> phyloRadOut      # 
+############################################################################################# 
+
+
+\n/);
+}
+
+
+#########################################################################
+#########################################################################
+#########################################################################
+#########################################################################
+#########################################################################
+
+sub clustertest {
+  die (qq/
+
+RADTools clustertest [options]
+
+
+-a  INT     a folder with individuals to be tested
+-t  INT     number of threads for cd-hit clustering [6]
+-c  FLOAT   Percent samples to share a locus [0.7] 
+-l  INT     read length of cleaned reads (no barcode\/RE sites) [90]
+-r  DIR     result dir
+    
+\n/) if !@ARGV;
+
+  my %opts = (a=>undef, r=>undef, l=>90, t=>6,c => 0.7);  
+  getopts('a:r:t:l:c:', \%opts);
+  
+  my $resdir = redir ($opts{r});
+  mkdir $resdir unless -e $resdir;
+  
+  my $threads = $opts{t};
+  my $mem = 0;
+  my $ma = 0.6;
+  my $rep = '"' . "vertebrata metazoa" . '"';
+  my $c = 1;
+  my $len = $opts{l}-1;
+  my $dir = redir ($opts{a});
+  my $missing = $opts{c};
+  my @lib = <$dir*_1_final.fastq> or die "Warning! No Input Libraries!\n";
+
+  my $sample = scalar (@lib);
+  my @percent;
+  for (my $miss = 1; $miss <= 10; $miss ++) {
+    my $p = substr ( ($opts{l}-$miss)/$opts{l}, 0, 6);
+    push @percent, $p;
+  }
+  
+  my $dd = 1;
+  foreach (@percent) {
+    my $per = $_;
+    my $resdir1 = $resdir . $dd . "/";
+    mkdir $resdir1 unless -e $resdir1;
+    foreach my $read1 (@lib) {
+      my $lib = $1 if basename($read1) =~ m/(\S+)_1_final/;
+      my $template = SEcdhit ($read1, $dir, $lib, $per, "0", $len, $resdir1,$threads);
+    }
+    $dd++;
+  }
+
+  
+  my $cc = 1;
+  foreach (1 .. 8) {
+    for (my $j = $cc; $j <= $cc + 2; $j = $j + 1) {
+      my $dir = $resdir . $cc. "/" ;
+      my $refdir = $resdir . $cc. "/". "popref" . $j . "/";
+      mkdir $refdir unless -e $refdir;      
+      my $ref = MakePopRef ($refdir, $dir, $missing, $sample, $percent[$j-1], $len, $threads);
+    }
+    $cc++;
+  }
+
+  my $test = $resdir . "NumberOfMarkersAmong.txt";
+  my $test2 = $resdir . "NumberOfMarkersWithin.txt";
+  open (OUT, ">", $test);
+  open (OUT2, ">", $test2);
+  
+  my %ind;
+  
+  for (my $i = 1; $i < 9 ; $i = $i + 1) {
+    my $dirs = $resdir . $i . "/";
+    my @inds = <$dirs*.unfiltered.fasta>;
+    foreach (@inds) {
+      my $file = $_;
+  
+      my $lib = $1 if basename ($file) =~ /(\S+)\.unfiltered\.fasta/;
+      my $c; 
+      open (IN, "<", $file);
+      while (<IN>) {
+	$c ++ if $_ =~ /^>/;
+      }
+      close IN;      
+      $ind{$i}{$lib} = $c;
+
+    }
+    
+    
+    my $ref1 = $resdir . $i . "/". "popref" . $i . "/" . "Reference.fasta";
+    my $ref2 = $resdir . $i . "/". "popref" . ($i+1) . "/" . "Reference.fasta";
+    my $ref3 = $resdir . $i . "/". "popref" . ($i+2) . "/" . "Reference.fasta";
+    
+    open (IN1, "<", $ref1);
+    my $count1 ;
+    while (<IN1>) {
+      $count1++ if $_ =~ /^>/;
+    }
+    close IN1;
+    
+    open (IN2, "<", $ref2);
+    my $count2 ;
+    while (<IN2>) {
+      $count2++ if $_ =~ /^>/;
+    }
+    close IN2;
+    
+    open (IN3, "<", $ref3);
+    my $count3 ;
+    while (<IN3>) {
+      $count3++ if $_ =~ /^>/;
+    }
+    close IN3;
+
+    print OUT "within_" .$i . "_between_". $i, "\t", $count1, "\n";
+    print OUT "within_" .$i . "_between_". ($i + 1), "\t", $count2, "\n";
+    print OUT "within_" .$i . "_between_". ($i + 2), "\t", $count3, "\n";
+  }
+ close OUT;
+  
+  foreach my $i (sort {$a <=> $b} keys %ind) {
+    foreach my $id (sort {$a cmp $b} keys %{$ind{$i}}) {
+      print OUT2 $ind{$i}{$id},"\t";     
+    }
+    print OUT2 "\n";
+  }
+  close OUT2;
+ 
+  
+}
+
+
+sub demultiplex {
+
+  die (qq/
+
+RADTools demultiplex [options]
+
+
+-a  DIR       a folder with all raw reads
+-b  FILE      a file contain all indexes
+-p            paired-end? [null]
+-d            allow one mismatch? [null]
+
+
+\n/) if !@ARGV;
+  
+  my %opts = (a=>undef, b=>undef);  
+  getopts('a:b:dp', \%opts);
+  
+  
+  my $barcode_file = $opts{b};
+  
+  my $folder = redir ($opts{a});
+  
+  my $resultDir = $folder.'demultiplexed_results';
+  mkdir $resultDir unless -d $resultDir;
+  
+  my @files = <$folder*_R1.fq>;
+  my $ID;
+  
+  open (IN, "<", $barcode_file);
+
+  
+  my %barcode;
+  my $lng;
+  while (<IN>) {
+    chomp (my @line = split /\s+/, $_);
+    $lng = length ($line[0]);
+    $barcode{$line[0]}++; 
+  }
+  close IN;
+
+ 
+ 
+  my %red;
+  
+  foreach my $index (keys %barcode){    
+    my $len = length ($index);
+    my $newindex;
+    for (my $i = 0; $i < $len; $i++) {
+      $newindex = $index;   
+      substr ($newindex, $i, 1) = "A";
+      $red{$newindex}++;
+      
+      $newindex = $index;
+      substr ($newindex, $i, 1) = "G";
+      $red{$newindex}++;
+      
+      $newindex = $index;
+      substr ($newindex, $i, 1) = "T";
+      $red{$newindex}++;
+      
+      $newindex = $index;
+      substr ($newindex, $i, 1) = "C";
+      $red{$newindex}++;
+      
+      $newindex = $index;
+      substr ($newindex, $i, 1) = "N";
+      $red{$newindex}++;
+    }
+    $red{$index} = 1;
+  }
+  
+  foreach my $index (keys %barcode) {
+
+    my @re = split //,$index;
+    my $len = scalar (@re);
+  
+    foreach my $file1 (@files) {
+      
+      open (IN,"<",$file1);
+      my $firstline = <IN>;
+      $ID = $1 if ($firstline =~ m/^\@([^:]+):/ );
+      print "can not find instrument ID!\n" if ($firstline !~ m/^\@[^:]+:/);
+      exit if ($firstline !~ m/^\@[^:]+:/);
+      close IN;
+      
+      my $file2 = $file1 if $opts{p};
+      $file2 =~ s/_R1/_R2/ if $opts{p};
+      my $lib = $1 if basename($file1) =~ m/(\S+)_R1\.fq/;
+      my $final1 = $resultDir . "/" . $lib . "_" . $index . "_R1.fq";
+      my $final2 = $resultDir . "/" . $lib . "_" . $index . "_R2.fq" if $opts{p};
+      open (IN1, "<", $file1) ;
+      open (IN2, "<", $file2) if $opts{p} ;
+      open (OUT1, ">", $final1) ;
+      open (OUT2, ">", $final2) if $opts{p} ;
+      while (<IN1>) {
+	chomp (my $line = $_);
+	if ($line =~ m /^\@$ID/) {
+	  chomp (my $seq = <IN1>);
+	  chomp (my $non = <IN1>);
+	  chomp (my $qual = <IN1>);
+	  
+	  my $first = substr($seq, 0, $len);
+	  my @start = split //,$first;
+	  
+	  my $d = 0;
+	  for (my $i = 0; $i < $len; $i++) {
+	    $d++ if $re[$i] ne $start[$i]; 
+	  }
+	  
+	  if ($opts{d}) {
+	    if ($d <= 1 && $red{$first} == 1) {
+	      print OUT1  $line, "\n", substr ($seq, $lng), "\n", $non, "\n",  substr ($qual, $lng), "\n";
+	      chomp (my $id2 = <IN2>) if $opts{p};
+	      chomp (my $seq2 = <IN2>) if $opts{p};
+	      chomp (my $non2 = <IN2>) if $opts{p};
+	      chomp (my $qual2 = <IN2>) if $opts{p};
+	      print OUT2  $id2, "\n", $seq2, "\n", $non2, "\n",  $qual2, "\n" if $opts{p} ;	  
+	    }
+
+	    else {
+	      chomp (my $id2 = <IN2>) if $opts{p} ;
+	      chomp (my $seq2 = <IN2>) if $opts{p}  ;
+	      chomp (my $non2 = <IN2>) if $opts{p}  ;
+	      chomp (my $qual2 = <IN2>) if $opts{p}  ;	    
+	    }	    
+	  }
+	  
+	  if (!$opts{d}) {
+	    if (substr ($seq, 0, $len) eq $index) {
+	      print OUT1  $line, "\n", substr ($seq, $lng), "\n", $non, "\n",  substr ($qual, $lng), "\n";
+	      chomp (my $id2 = <IN2>) if $opts{p};
+	      chomp (my $seq2 = <IN2>) if $opts{p};
+	      chomp (my $non2 = <IN2>) if $opts{p};
+	      chomp (my $qual2 = <IN2>) if $opts{p};
+	      print OUT2  $id2, "\n", $seq2, "\n", $non2, "\n",  $qual2, "\n" if $opts{p} ;	  
+	    }
+	    
+	    else {
+	      chomp (my $id2 = <IN2>) if $opts{p} ;
+	      chomp (my $seq2 = <IN2>) if $opts{p}  ;
+	      chomp (my $non2 = <IN2>) if $opts{p}  ;
+	      chomp (my $qual2 = <IN2>) if $opts{p}  ;	    
+	    }
+	  }
+	}
+    }
+    close IN1; 
+    close IN2 if $opts{p}; 
+    close OUT1; 
+    close OUT2 if $opts{p} ; 
+    
+    }
+  
+  }
+}
+
+sub preClean {
+  die (qq/
+
+RADTools preClean [options]
+
+
+-a  DIR   a folder with all raw reads
+-z        use fasqc to evaluate quality of the raw reads?[null]
+
+
+\n/) if !@ARGV;
+  my %opts = (a=>undef);  
+  getopts('a:z', \%opts);
+  
+
+  my $orig_folder = redir ($opts{a});
+  
+  
+  
+  my $Result_dir1 = $orig_folder . 'combined/';
+  mkdir $Result_dir1 unless -e  $Result_dir1;
+  my $Result_dir2 = $orig_folder . 'pre-clean/';
+  mkdir $Result_dir2 unless -e  $Result_dir2;
+  
+  my @orig_files = <$orig_folder*.gz>; 
+  
+  die(qq/\nHmm...Is it the right folder? \n\n/) if (scalar (@orig_files) == 0);
+  
+  foreach (<@orig_files>) {
+    my $file = basename($_) =~ /(\S+_R[1|2])_\d+.fastq.gz/;
+    die(qq/\nHmm...the name of the library doesn't match. Check\/modify line 34 of this script. \n\n/) if (!basename($_));
+    my $lib_name = $1;
+    my $file2 = $orig_folder . $1 .  '*'. '.fastq.gz';
+    my $combined = $Result_dir1 . $1 . '.fastq.gz'; 
+    system ("cat $file2 > $combined ") unless -e $combined;
+  }
+  
+  
+  my @merged_files = < $Result_dir1*.fastq.gz> ;
+  foreach my $file (<@merged_files>) {
+    my $out = $Result_dir2 .  $1 . $2 . ".fq" if basename($file)  =~ /(\S+)_L\d+(_R[1|2]).fastq.gz/;
+    my $redundancy = '^--$' ; 
+    print "cleaning","\t",$file,"\n";
+    if ($file =~ m/_R(\d+).fastq.gz/) {
+      if ($1 == 1) {
+	system ("zcat $file | grep -A 3 \'^@.* [^:]*:N:[^:]*:\'  | grep -v $redundancy | sed \'s/ 1:N:0:.*/\\/1/g\' > $out");
+      }
+      if ($1 == 2) {
+	system ("zcat $file | grep -A 3 \'^@.* [^:]*:N:[^:]*:\' | grep -v $redundancy | sed  \'s/ 2:N:0:.*/\\/2/g\' > $out");
+      }
+      
+    }
+  }
+
+  
+  if ($opts{z}){
+    my @raw = < $Result_dir2*.fq> ;
+    my $outdir =  $Result_dir2.'evaluation/';
+    mkdir $outdir unless -e $outdir;
+    foreach (<@raw>) {
+      
+      my $call1 = system("fastqc -t 2 $_ -o $outdir");
+      die(qq/\nThe program "fastQC" is not in path! \n\n/) if ($call1 == -1 );
+      
+      system ("rm $outdir*fastqc.zip");
+    }
+  }
+  
+  if (!$opts{z}) {    
+    print "This is a reminder: No evaluation on raw sequence reads. If you would like to do so please use fastqc option." , "\n";  
+  } 
+}
+
+
+sub angsd {
+  die(qq/
+Usage RADTools angsd [options]
+
+Options: 
+
+Basic:
+         -b FILE  a file that contains names (and paths) of all BAM files (alignment) generated by the SamTools 
+         -f FILE  a file that contains all sites to keep, file must end by ".keep"
+         -r FILE  reference fasta file used to align reads and generate BAM alignment files listed in a file after "-b"
+         -a FILE  ancestral file, if no ancestral file then just use reference fasta file for -a
+         -F INT   1=folded 0=unfolded [1]. You have to do folded if an ancestral fasta is unavailable 
+         -Q INT   minimal Phred quality score to keep a base [20]
+         -q INT   minimal map quality [2]
+         -t INT   number of threads [4]
+         -g INT   genotype output options [2]
+                  1 = print out major minor 
+                  2 = print the called genotype as 0,1,2 (used by Format_converter.pl PCA)
+                  4 = print the called genotype as AA, AC, AG, ... (used by PopGenomics.pl geno_to_structure) 
+                  8 = print all 3 posts (major,major),(major,minor),(minor,minor)
+                  16 = print the posterior of the called genotype
+                  32 = somewhat different dumps the binary posterior for all samples, encoded as 3*nind double
+                  64 = all above    
+         -n INT   sample size
+         -o INT   outfile Prefix
+
+Theta Estimate:
+         -T       estimating per-site thetas? [null]
+
+SNP\/Genotype calling:
+         -c INT   1 = call genotypes; 0 = no [0]
+         -s INT   1 = call SNPs; 0 = no [0]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~         
+         if c = 1
+         -P FLOAT Posterior prob cutoff for calling genotypes [0.95]        
+         -e INT   1 = estimate the posterior genotype probability based on the allele frequency as a prior
+                  2 = estimate the posterior genotype probability assuming a uniform prior 
+                  [1]
+         -h INT   min depth to call genotypes [0]
+         -d INT   Discard site if effective sample size below value. 0 indicates no filtering [0]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+         if s = 1 
+         -v FLOAT The p-value used for calling SNPs [1e-6]
+         -m FLOAT Remove sites with MAF below [0]
+
+
+Note: calling genotypes and snps should be done at the same time. For example, if you use c = 1 then s must be 1 as well. 
+
+\n/) if (!@ARGV);
+ 
+ my %opts = (b=>undef, f=>undef, r=>undef,a=>undef, F=>1, Q=>20, q=>2, c=>0, g=>2, o=>undef,t=>4,n=>undef,c=>0,s=>0,P=>0.95, e=>1, h=>0, d=>0, v=>1e-6,m=>0);
+ getopts('b:f:r:a:F:Q:q:n:c:g:o:t:c:s:P:e:h:d:v:m:T', \%opts);
+ my $angsd = 'angsd';
+ my $emOptim = 'emOptim2';
+ my $dirname = dirname ($opts{r});
+ 
+ 
+ my $resdir = $dirname . "/ANGSD/";
+ mkdir  $resdir unless -d $resdir;
+ $opts{o} = $resdir .  $opts{o};
+ 
+ my $threads = $opts{t};
+ system ("cut -f1 $opts{f} | uniq > pos");
+ my $rf =  $opts{o} . "_rffile";
+ open (IN, '<', 'pos');
+ open (OUT, '>', $rf );
+ foreach (<IN>) {
+   chomp();
+   print OUT $_, ":", "\n";
+ }
+ system ("rm pos");
+ system ("angsd sites index $opts{f}");
+ 
+ open(IN, "<", $opts{b});
+ while (<IN>) {
+ chomp (my $line = $_);
+ system ("samtools index $line");
+ } 
+ close IN;
+
+ 
+ if ($opts{F} == 1 ) { #folded
+   if ($opts{c} == 1) { #call genotypes
+     if ($opts{s} == 1) { #call SNPs
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1 -out $opts{o}  -GL 1  -doGeno $opts{g}  -doPost $opts{e}  -postCutoff $opts{P}   -doCounts 1 -doGlf 4 -geno_minDepth $opts{h} -minInd $opts{d} -SNP_pval $opts{v} -minMaf $opts{m}   -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf");
+       system (" $emOptim $opts{o}.saf $opts{n} -P $opts{t} >  $opts{o}.saf.sfs") if $opts{T} ; 
+       
+       system (" $angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1   -GL 1  -doGeno $opts{g}  -doPost $opts{e}  -postCutoff $opts{P}   -doCounts 1 -doGlf 4 -geno_minDepth $opts{h} -minInd $opts{d} -SNP_pval $opts{v} -minMaf $opts{m}   -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf  -out $opts{o}.thetas  -doThetas 1 -pest  $opts{o}.saf.sfs  ") if $opts{T};
+         
+     }
+     if ($opts{s} == 0) {       
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1 -out $opts{o}  -GL 1  -doGeno $opts{g}  -doPost $opts{e}  -postCutoff $opts{P}   -doCounts 1 -doGlf 4 -geno_minDepth $opts{h} -minInd $opts{d}  -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf");
+       system (" $emOptim $opts{o}.saf $opts{n} -P $opts{t} >  $opts{o}.saf.sfs") if $opts{T};        
+       system (" $angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1  -GL 1  -doGeno $opts{g}  -doPost $opts{e}  -postCutoff $opts{P}   -doCounts 1 -doGlf 4 -geno_minDepth $opts{h} -minInd $opts{d}  -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf  -out $opts{o}.thetas  -doThetas 1 -pest  $opts{o}.saf.sfs  ") if $opts{T};
+      
+     }  
+   }
+   if ($opts{c} == 0) { 
+     
+     if ($opts{s} == 1) { #call SNPs
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1 -out $opts{o}  -GL 1  -doGeno $opts{g}  -doPost $opts{e} -SNP_pval $opts{v} -minMaf $opts{m} -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf");
+       system (" $emOptim $opts{o}.saf $opts{n} -P $opts{t} >  $opts{o}.saf.sfs") if $opts{T}; 
+       
+       system (" $angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1  -GL 1  -doGeno $opts{g}  -doPost $opts{e} -SNP_pval $opts{v} -minMaf $opts{m} -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf   -out $opts{o}.thetas  -doThetas 1 -pest  $opts{o}.saf.sfs ") if $opts{T};
+         
+     }
+     if ($opts{s} == 0) {       
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1 -out $opts{o}  -GL 1  -doGeno $opts{g}  -doPost $opts{e} -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf");
+       system (" $emOptim $opts{o}.saf $opts{n} -P $opts{t} >  $opts{o}.saf.sfs") if $opts{T};        
+       system (" $angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1   -GL 1  -doGeno $opts{g}  -doPost $opts{e} -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf -out $opts{o}.thetas  -doThetas 1 -pest  $opts{o}.saf.sfs ") if $opts{T};
+      
+     } 
+   }
+ }
+ 
+  if ($opts{F} == 0 ) { #unfolded
+   if ($opts{c} == 1) { #call genotypes
+     if ($opts{s} == 1) { #call SNPs
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1 -out $opts{o}  -GL 1  -doGeno $opts{g}  -doPost $opts{e}  -postCutoff $opts{P}   -doCounts 1 -doGlf 4 -geno_minDepth $opts{h} -minInd $opts{d} -SNP_pval $opts{v} -minMaf $opts{m}   -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf");
+       my $unfolded = 2*$opts{n};
+       system (" $emOptim $opts{o}.saf $unfolded -P $opts{t} >  $opts{o}.saf.sfs") if $opts{T} ; 
+       
+       system (" $angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1   -GL 1  -doGeno $opts{g}  -doPost $opts{e}  -postCutoff $opts{P}   -doCounts 1 -doGlf 4 -geno_minDepth $opts{h} -minInd $opts{d} -SNP_pval $opts{v} -minMaf $opts{m}   -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf    -out $opts{o}.thetas  -doThetas 1 -pest  $opts{o}.saf.sfs ") if $opts{T} ;
+         
+     }
+     if ($opts{s} == 0) {       
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1 -out $opts{o}  -GL 1  -doGeno $opts{g}  -doPost $opts{e}  -postCutoff $opts{P}   -doCounts 1 -doGlf 4 -geno_minDepth $opts{h} -minInd $opts{d}  -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf");
+       my $unfolded = 2*$opts{n};
+       system (" $emOptim $opts{o}.saf $unfolded -P $opts{t} >  $opts{o}.saf.sfs") if $opts{T} ;        
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1  -GL 1  -doGeno $opts{g}  -doPost $opts{e}  -postCutoff $opts{P}   -doCounts 1 -doGlf 4 -geno_minDepth $opts{h} -minInd $opts{d}  -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf    -out $opts{o}.thetas  -doThetas 1 -pest  $opts{o}.saf.sfs ") if $opts{T};
+      
+     }  
+   }
+   if ($opts{c} == 0) { 
+        
+     if ($opts{s} == 1) { #call SNPs
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1 -out $opts{o}  -GL 1  -doGeno $opts{g}  -doPost $opts{e} -SNP_pval $opts{v} -minMaf $opts{m} -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf");
+       my $unfolded = 2*$opts{n};
+       system (" $emOptim $opts{o}.saf $unfolded -P $opts{t} >  $opts{o}.saf.sfs") if $opts{T} ; 
+       
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1   -GL 1  -doGeno $opts{g}  -doPost $opts{e} -SNP_pval $opts{v} -minMaf $opts{m} -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf  -out $opts{o}.thetas  -doThetas 1 -pest  $opts{o}.saf.sfs ") if $opts{T} ;
+         
+     }
+     if ($opts{s} == 0) {       
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1 -out $opts{o}  -GL 1  -doGeno $opts{g}  -doPost $opts{e} -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf");
+       my $unfolded = 2*$opts{n};
+       system (" $emOptim $opts{o}.saf $unfolded -P $opts{t} >  $opts{o}.saf.sfs") if $opts{T} ;        
+       system ("$angsd -bam $opts{b} -sites $opts{f} -ref $opts{r} -anc $opts{a}  -only_proper_pairs 1  -minMapQ $opts{q} -minQ $opts{Q} -fold 1   -GL 1  -doGeno $opts{g}  -doPost $opts{e} -doMaf 2 -doMajorMinor 1 -doSaf 1 -rf $rf  -out $opts{o}.thetas  -doThetas 1 -pest  $opts{o}.saf.sfs") if $opts{T};
+      
+     } 
+   }
+ }
+}
+
+sub popRad {
+  die(qq/
+
+RADTools popRad [options] 
+
+options:
+
+-a     DIR      A folder with all unfiltered RAD files (AAA.unfiltered.fasta, 
+                BBB.unfiltered.fasta, CCC.unfiltered.fasta...)
+                full path!!
+-s     INT      Number of samples
+-b     DIR      A folder that contains all cleaned reads 
+                PE: AAA_1_final.fastq, AAA_final.fastq, 
+                AAA_Merged_final.fastq, AAA_Unpaired_final.fastq
+                SE: AAA_1_final.fastq, BBB_1_final.fastq 
+-G     JAR      GATK.jar (full path)
+-P     JAR      Picard.jar (full path)
+-g     FLOAT    percent identity for clustering among samples [0.9]
+-c     FLOAT    Percent samples to share a locus, otherwise removed [0.7]
+-C     INT      length cutoff of throw-away markers [36]
+-t     INT      Number of processors used for clustering [10]
+-k     INT      Min number of individuals with less than -u INT coverage 
+-u     INT      Minimum individual coverage threshold used in -k
+-d     INT      Minimum percentile site read depth [1]
+-D     INT      Maximum percentile site read depth [99]
+-Q     INT      Minimum RMS mapping quality for SNPS [10]
+-S     FLOAT    Min p-value for strand bias [0] ## must be 0 for RAD data
+-q     FLOAT    Min p-value for base quality bias [1e-100]
+-f     FLOAT    Min p-value for map quality bias [0]
+-e     FLOAT    Min p-value for end distance bias [0] muse be 0 for RAD data
+-h     FLOAT    Min p-value for exact test of HWE [1e-4]
+-H     FLOAT    Min p-value for exact test of excess of heterozygous [0]
+-L     FLOAT    Min p-value for exact test of defect of heterozygous [0]
+-l     INT      Remove SNPs\/sites within l bp upstream and downstream 
+                around an INDEL [10]
+-x     CHAR     p=paired-end, s=single-end [p]
+
+
+\n\n/) unless (@ARGV);
+  
+  
+  my %opts = (a=>undef,s=>undef, c=>0.7, g=>0.90, b=>undef, p=>4, d=>1, D=>99, k=>undef, u=> undef, Q=>10, S=>0, q=>1e-100 , f=>0, e=>0, h=>1e-4, H=>0, L=>0,l=>10, G=> undef, P=>undef, x => 'p',C=>36, t=>10 );
+  getopts('a:c:s:b:p:d:D:k:u:Q:S:q:f:e:h:H:L:l:G:P:x:g:C:t:', \%opts);
+  
+  
+  my $dir;
+  
+  if ($opts{a} =~ m/\/$/ ){
+    $dir = $opts{a}; 
+  }
+  else {
+    $dir = $opts{a} . "/";
+  }
+  
+  my $missing = $opts{c};
+  my $sample = $opts{s};
+  my $p = $opts{p};
+  my $numT = $opts{t};
+  my $th =  $opts{g}; 
+  my $lengthcutoff = $opts{C}; 
+  
+  my $readFolder = $opts{b};
+  if ($opts{b} =~ m/\/$/ ){
+    $readFolder = $opts{b}; 
+  }
+  else {
+    $readFolder = $opts{b} . "/";
+  }
+    
+  if ($opts{k} !~ m/^\d+$/g || $opts{u} !~ m/^\d+$/g) {
+    die(qq/option -k and -u are inter-dependent (min number of -k INT individuals with less than -u INT coverage)\n/);
+  }
+  
+ 
+  
+  my $refdir = $dir . "PopGen_reference/";
+  mkdir $refdir unless -e $refdir;
+  
+  print "\n\n\nNow generating a reference genome for all samples! \n\n";
+ 
+   
+  my $ref = MakePopRef ($refdir, $dir, $missing, $sample,  $th, $lengthcutoff, $numT);
+  #my $ref = "/global/home/kebi/data/demonsion/final/PopGen_reference/Reference.fasta";
+ 
+  my $raw;
+  if ($opts{x} eq 'p') {
+    $raw = generateVCF ( $ref, $readFolder, $refdir, $p,$opts{G}, $opts{P},'pe');
+  }
+  if ($opts{x} eq 's'){
+    $raw = generateVCF ( $ref, $readFolder, $refdir, $p,$opts{G}, $opts{P},'se');
+  }
+ 
+  my $site_percentile = $refdir . "sites_depth_percentile.txt";
+  
+  my $bed = filtering ($refdir, $raw, $site_percentile, $opts{d}, $opts{D}, $opts{k}, $opts{u}, $opts{Q}, $opts{S}, $opts{q}, $opts{f}, $opts{e}, $opts{h}, $opts{H}, $opts{L}, $opts{l});
+  
+}
+
+sub self {
+  my ($new_master, $final_marker, $resdir, $name, $seqnumber, $missing, $kouling, $numT) = @_;
+  #self ($final_cluster, $fa1, $dir, $name, $samples, $missing, "1", "4");
+
+  my $blastout = $resdir . $name .'.blast.out';
+  my $new_master1 = $new_master . "_copy";
+  system ("cp $new_master $new_master1" );
+  my $call1 = system("makeblastdb -in $new_master -dbtype nucl > log");
+  system("blastn -db $new_master -query $new_master1  -evalue 1e-20 -outfmt 6 -num_threads $numT -out $blastout") if  $kouling ==1 ;
+  system("blastn -db $new_master -query $new_master1  -evalue 1e-20 -outfmt 6 -num_threads $numT -out $blastout") if  $kouling == 2 ;
+  
+  system("rm $new_master.n* $new_master1  log");
+  
+  my $hash = seqhash($new_master);
+  
+  my %seq = %{$hash};
+  my %final= %{$hash};
+  
+  my %final_all = ();
+  my %tmp;
+
+ 
+  open (OUT, ">", $final_marker) if ($kouling == 1);
+
+  
+  my %del;
+  if ($kouling == 2) {
+    open(IN, "<", $blastout);
+    my $first = <IN>;
+    chomp (my @line = split /\s+/, $first);
+    my $first1 = $line[0];
+    push (@{$tmp{$first1}},\@line);
+    
+    my $dd = 1;
+    while (<IN>) { 
+      chomp(my $line = $_);
+      my @d = split(/\s+/,$line);
+      my $gene = $d[0];
+      if ($gene eq $first1) {
+	push (@{$tmp{$gene}},\@d);
+	$dd++;
+      }
+      else {
+	delete $tmp{$first1} if $dd/$seqnumber < $missing;
+	$del{$first1}++ if $dd/$seqnumber < $missing;
+	
+	push (@{$tmp{$gene}},\@d);
+	$first1 = $gene;
+	$dd = 1;
+      }
+    }
+    close IN;
+    
+  
+    
+    my $final1 = parseBlast (\%final, \%tmp, $kouling,$seqnumber,$missing,\%seq,\%del);
+    my %new = %{$final1};
+    
+    open (OUT, ">", $final_marker);
+    
+    foreach my $anno (sort {$a cmp $b} keys %new) {
+      print OUT  ">", $anno, "\n", $new{$anno}{'seq'}, "\n";     
+    }   
+    close OUT;
+    
+  } ##if ($kouling == 2) {
+
+  open(IN, "<", $blastout);
+    
+  my $dd = 1;
+  my $first = <IN>;
+  chomp (my @line = split /\s+/, $first);
+  my $gene = $line[0];
+  #my @match = @line[0 ..$#line];
+  push (@{$tmp{$gene}},\@line);
+
+
+  
+  while (<IN>) { 
+    chomp(my $line = $_);
+    my @d = split(/\s+/,$line);
+    
+    if (!eof) {
+      if ($d[0] eq $gene) {
+	push(@{$tmp{$d[0]}},\@d);
+	$gene = $d[0];
+      }   
+      if ($d[0] ne $gene) {
+	$dd++;
+
+	if ($dd < 20001) {	
+	  push(@{$tmp{$d[0]}},\@d);
+	  $gene = $d[0];	  
+	}
+	
+	elsif ($dd == 20001) {
+	  
+	  if ($kouling == 1 ) {
+	    my $final1 = parseBlast (\%final, \%tmp, $kouling,$seqnumber,$missing,\%seq,\%del);
+	    %final = %{$final1};
+	  }
+	  
+	  if ($kouling == 3 ) {
+	    my $final1 = parseBlast (\%final, \%tmp, $kouling,$seqnumber,$missing,\%seq,\%del);
+	    %final = %{$final1};
+	  }
+	  
+	
+	  undef %tmp;
+	  push(@{$tmp{$d[0]}},\@d);
+	  $gene = $d[0];
+	  $dd = 1;
+	  
+	  
+	} ##if ($dd == 101) {
+	
+      } ##if ($d[0] ne $gene) {
+      
+    } ## if (!eof)
+    
+    if (eof) {
+      
+      push(@{$tmp{$d[0]}},\@d);
+
+      if ($kouling == 1 ) {
+	my $final1 = parseBlast (\%final, \%tmp, $kouling,$seqnumber,$missing,\%seq,\%del);
+	%final = %{$final1};
+      }
+      if ($kouling == 3 ) {
+	my $final1 = parseBlast (\%final, \%tmp, $kouling,$seqnumber,$missing,\%seq,\%del);
+	%final = %{$final1};
+      }
+    }
+    
+  } ##while (<IN>)
+  close IN;
+  #system("rm $blastout"); 
+  
+  if ($kouling == 1 || $kouling == 3) {
+    foreach my $anno (sort {$a cmp $b} keys %final) {
+      print OUT  ">", $anno, "\n", $final{$anno}{'seq'}, "\n";     
+    }   
+  }
+  close OUT; 
+     
+}
+
+
+
+sub parseBlast {
+  my ($final, $tmp, $kouling,$seqnumber,$missing,$seq, $del) = @_;
+  my %final = %{$final};
+  my %tmp = %{$tmp};
+  my %final1;
+  my %seq = %{$seq};
+  my %del = %{$del};
+  
+  if ($kouling == 1) {
+    foreach my $id (sort {$a cmp $b} keys %tmp) {
+      if (scalar(@{$tmp{$id}}) > 1 ) {
+	for (my $i = 0; $i < scalar(@{$tmp{$id}}); $i++) {   
+	  for (my $j = $i+1; $j < scalar(@{$tmp{$id}}); $j++) {
+	    if ($tmp{$id}[$i][1] ne $tmp{$id}[$j][1]) {
+	      
+	      delete $final{$tmp{$id}[$j][1]}  if ($final{$tmp{$id}[$j][1]});
+	      delete $final{$tmp{$id}[$i][1]}  if ($final{$tmp{$id}[$i][1]});
+	      
+	    }
+	  } 
+	} 
+      }
+    }
+    return (\%final);
+  } #($kouling == 1)
+
+  
+  
+  
+  if ($kouling == 2) {
+    foreach my $id (sort {$a cmp $b} keys %tmp) {
+     
+      if (@{$tmp{$id}} && scalar(@{$tmp{$id}}) > 0 ) {
+	if ((scalar(@{$tmp{$id}})/$seqnumber) >= $missing && $seqnumber > 0) {
+	  my %match;
+	  
+	  for (my $i = 0; $i < scalar(@{$tmp{$id}}); $i++) {
+	    if (!$del{$tmp{$id}[$i][1]}) {
+	      my $seq1 =  $seq{$tmp{$id}[$i][1]}{'seq'};
+	      my $N1 =  ($seq1 =~ s/N//g);
+	      my $len1 = $seq{$tmp{$id}[$i][1]}{'len'}  - $N1;
+	      
+	      $match{$tmp{$id}[$i][1]} =  $len1;      
+
+	    } ## if (!$del{$tmp{$id}[$i][1]})
+	  } ##for (my $i = 0; $i < scalar(@{$tmp{$id}}); $i++)
+	  
+	  
+	  foreach my $ids (sort { $match{$b} <=> $match{$a} } keys %match) {
+	    $final1{$ids}{'seq'} = $final{$ids}{'seq'};
+	    $final1{$ids}{'len'} = $final{$ids}{'len'};
+	    last; 
+	  }
+	  
+	}## if ((scalar(@{$tmp{$id}})/$seqnumber) >= $missing && $seqnumber > 0) {
+
+        else {
+	  $del{$id}++;
+	}
+
+
+	
+      }   
+    } ##foreach my $id (sort {$a cmp $b} keys %tmp)
+    
+    return (\%final1);
+  } ##($kouling == 2)
+  
+} ##sub parseBlast
+
+sub filtering {
+  my ($refdir, $raw, $out, $d, $D, $k, $u, $Q, $S, $q, $f, $e, $h, $H, $L, $l)= @_;  
+  
+  my @depth;
+  open (RAW, "<", $raw);
+  while (<RAW>) {
+    chomp (my @line = split /\s+/, $_);
+    next if $line[0] =~ /^#/;
+    my $dep = $1 if $line[7] =~ m /DP=(\d+);/;
+    push @depth, $dep;
+  }
+  seek RAW,0,0;
+  
+
+  my ($low, $high) = percentile (\@depth, $out, $d, $D);
+  
+ 
+  my %contig_to_remove;
+  my %bed;
+  my %indel;
+  my %dump;
+  my ($n_sites, $ind_dp, $prev_format, @format, @ind_depth) = (0,0,"");
+  my ($prev_contig, $cur_contig, $pos) = ('start','start',0);
+  
+  
+  #open some necessary filehandles
+  my $bed = $refdir . "Sites_passed_filters.keep";  
+  open(KEEP, ">", $bed);
+  my $dump = $refdir . "Sites_passed_filters.dumped";
+  open(DUMP, ">", $dump);
+  
+  while (<RAW>) {
+    my $violate; # for flagging filter violations
+    chomp (my @t = split /\s+/, $_);
+
+    next if ( $t[0] =~ m /^#/);
+    
+    $pos = $t[1];
+    
+    if($t[0] ne $cur_contig){
+	$prev_contig = $cur_contig;
+	$cur_contig = $t[0];
+    }
+    
+    # Skip sites with unknown ref
+    $violate .= 'N' if ($t[3] eq 'N');
+    
+    # Skip non-biallelic Sites
+    $violate .= '2' if ($t[4] =~ m/,/); 
+    
+    $violate .= 'I' if ($t[7] =~ m/INDEL/);
+
+    # Eveness across individuals coverage filter
+    # check where in vcf FORMAT the DP ID is	
+    if( $prev_format ne $t[8] ){
+	$ind_dp = 0;
+	$prev_format = $t[8];
+	@format = split(":",$t[8]);
+	foreach (@format) {
+	    $ind_dp++ if($_ ne 'DP'); ## so $ind_dp is offset by 1
+	    last if($_ eq 'DP');
+	}
+    }
+    
+    my $covcount = 0;
+    my @genoinfo = @t[9 .. $#t];
+    if( $ind_dp <= $#format ) { # if DP is missing in vcf skip even coverage filter
+      for(my $i=0; $i <= $#genoinfo; $i++) {
+	my @ind_info = split(":", $genoinfo[$i]);
+	$covcount++ if ($ind_info[$ind_dp] >= $u);
+	$ind_depth[$i] += $ind_info[$ind_dp];
+      }
+      $violate .= 'k' if ($covcount <= $k);	
+    }
+    else {
+      warn("WARNING: no individual depth information at ",$cur_contig,", pos ",$pos,". Check for \"samtools mpileup -t DP\" option.");
+      print "program is quitting!\n";
+      exit;
+    }
+    
+    # Site coverage 
+    my ($dp, $dp_alt) = (0,0);
+    if ($t[7] =~ m/DP4=(\d+),(\d+),(\d+),(\d+)/i) {
+	$dp = $1 + $2 + $3 + $4;
+	$dp_alt = $3 + $4;
+    }
+    
+    if ($low >= $d * $u) {
+      $violate .= 'd' if ($dp <= $low);
+    }
+    if ($low < $d * $u) {
+      $violate .= 'd' if ($dp <= $d * $u);
+    }
+        
+    $violate .= 'D' if ($dp >= $high);
+    
+    
+    my $mq = $1 if ($t[7] =~ m/MQ=(\d+)/i);
+    $violate .= 'Q' if ($mq && $mq < $Q);
+
+    # Strand, baseQ, mapQ, and tail distance bias
+    my ($strand, $baseqb, $mapqb, $tail_dist);
+    if ($t[7] =~ m/PV4=([^,]+),([^,]+),([^,]+),([^,;\t]+)/) {
+      $strand = $1;
+      $baseqb = $2;
+      $mapqb = $3;
+      $tail_dist = $4;
+    }
+    $violate .= 'S' if ($strand && $strand < $S);
+    $violate .= 'q' if ($baseqb && $baseqb < $q);
+    $violate .= 'f' if ($mapqb && $mapqb < $f);
+    $violate .= 'e' if ($tail_dist && $tail_dist < $e);
+   
+    # HWE exact test
+    if ($t[4] ne '.') {
+      my %genocount = (homoa => 0, homob => 0, het => 0);
+      foreach (@genoinfo) {
+	if (/0\/0:/) {
+	  $genocount{homoa}++;
+	} elsif (/1\/1:/) {
+	  $genocount{homob}++;
+	} elsif (/0\/1:|1\/0:/) {
+	  $genocount{het}++;
+	}
+      }
+      
+      my ($pHWE, $pHI, $pLOW) = hwe_exact($genocount{het},$genocount{homoa},$genocount{homob},0);
+      
+      die(qq/Genotype counts less than 0\n/) if $pHWE == -1;
+      
+      if ($pHWE < $h) {
+	$violate .= "h(p=$pHWE)";
+      }
+      if ($pHI < $H) {
+	$violate .= "H(p=$pHI)";
+      }
+      if ($pLOW < $L) {
+	$violate .= "L(p=$pLOW)";
+      }
+    } ##if ($t[4] ne '.') 
+    
+
+    $bed{$t[0]}{$t[1]}++ if (! $violate); 
+    
+    if ($violate) {
+      $dump{$t[0]}{$t[1]} = $violate;
+      
+      if ($violate =~ m /[H|L|h]/) {
+       $contig_to_remove{$t[0]}++;
+      }
+      
+      if ($violate =~ m /I/) {	
+	for (my $i = $t[1] - $l;   $i<= $t[1] + length($t[3]) + $l; $i ++) {
+	  $indel{$t[0]}{$i}++;
+	}
+      }
+    } 
+  }
+
+  foreach my $contig (sort {$a cmp $b} keys %bed) {
+    foreach my $pos (sort {$a <=> $b} keys %{$bed{$contig}} ) {
+      unless ($contig_to_remove{$contig}) {
+	unless  ($indel{$contig}{$pos} ) {
+	  print KEEP $contig, "\t", $pos, "\n";
+	}
+      }
+    }
+  }
+  close KEEP;
+  
+  foreach my $contig (sort {$a cmp $b} keys %dump) {
+    foreach my $pos (sort {$a <=> $b} keys %{$dump{$contig}} ) {
+      print DUMP $dump{$contig}{$pos}, "\t", $contig, "\t", $pos, "\n"; 
+    }
+  }
+  close DUMP;
+}
+
+
+
+sub hwe_exact {
+
+# Citation:
+# Implements an exact SNP test of Hardy-Weinberg Equilibrium as described in Wigginton et al. 2005
+# note that probabilities are calculated from the midpoint in order to take advantage of the recurrence
+# relationships recognized in Guo and Thompson (1992) in the implementation of their MCMC sampler
+
+    my ($obs_hets, $obs_homa, $obs_homb, $F) = @_;
+
+    return(-1) if ($obs_hets < 0 || $obs_homa < 0 || $obs_homb < 0);
+
+    my $obs_homr; #rare homozygote
+    my $obs_homc; #commmon homozygote
+    my $n = $obs_homa + $obs_homb + $obs_hets; # total number genotypes
+
+    # define common and rare homozygotes
+    if ($obs_homa > $obs_homb) {
+	$obs_homc = $obs_homa;
+	$obs_homr = $obs_homb;
+    } elsif ($obs_homa < $obs_homb) {
+	$obs_homc = $obs_homb;
+	$obs_homr = $obs_homa;
+    } elsif ($obs_homa == $obs_homb) { # need to check how matching number homos affects algorithm
+	$obs_homc = $obs_homa;
+	$obs_homr = $obs_homb;
+    }
+
+    my $rare = 2 * $obs_homr + $obs_hets; # number of minor alleles
+
+    # theta for inbreeding HWE calculations
+    my $pc = 1 - $rare/(2*$n);
+    my $pr = 1 - $pc;
+    my $pCC = $pc**2 + $pc*$pr*$F;
+    my $pCR = 2*$pc*$pr - 2*$pc*$pr*$F;
+    my $pRR = $pr**2 + $pc*$pr*$F;
+    $pRR = 1e-6 if($pRR == 0);
+    my $theta = ($pCR**2)/($pCC*$pRR);
+    $theta = 1e-6 if($theta == 0);
+
+    # initialize heterozygote probability array
+    my @probs;
+    for (my $i = 0; $i <= $rare; $i++) {
+	$probs[$i] = 0.0;
+    }
+
+    # find midpoint of the minor allele count distribution
+    my $mid = int($rare * (2 * $n - $rare) / (2 * $n));
+    $mid = $mid + 1 if ( ($mid % 2) != ($rare % 2) ); # ensures number minor alleles and midpoint have parity
+
+    my $curr_hets = $mid;
+    my $curr_homr = ($rare - $mid) / 2;
+    my $curr_homc = $n - $curr_hets - $curr_homr;
+
+    $probs[$mid] = 1.0;
+    my $sum = $probs[$mid];
+
+    # calculate probabilities from midpoint down 
+    for ($curr_hets = $mid; $curr_hets > 1; $curr_hets -= 2) {
+	$probs[$curr_hets - 2] = $probs[$curr_hets] * $curr_hets * ($curr_hets - 1) / 
+	    ($theta * ($curr_homr + 1) * ($curr_homc + 1));
+	$sum += $probs[$curr_hets - 2];
+
+	# 2 fewer heterozygotes for next iteration -> add one rare, one common homozygote
+	$curr_homr++;
+	$curr_homc++;
+    }
+
+    # calculate  probabilities from midpoint up
+    $curr_hets = $mid;
+    $curr_homr = ($rare - $mid) / 2;
+    $curr_homc = $n - $curr_hets - $curr_homr;
+
+    for ($curr_hets = $mid; $curr_hets <= $rare - 2; $curr_hets += 2) {
+	$probs[$curr_hets + 2] = $probs[$curr_hets] * $theta * $curr_homr * $curr_homc /
+	    (($curr_hets + 2) * ($curr_hets + 1));
+	$sum += $probs[$curr_hets + 2];
+	
+	# add 2 heterozygotes for next interation -> subtract one rare, one common homozygote
+	$curr_homr--;
+	$curr_homc--;
+    }
+    for (my $i = 0; $i <= $rare; $i++) {
+	$probs[$i] /= $sum;
+    }
+
+    # p-value calculation for hwe
+    my $p_hwe = 0.0;
+    for (my $i = 0; $i <= $rare; $i++) {
+	next if ($probs[$i] > $probs[$obs_hets]);
+	$p_hwe += $probs[$i];
+    }
+    $p_hwe = 1.0 if ($p_hwe > 1);
+
+    # alternate p-value calculation for p_hi/p_low heterozygous
+    my $p_hi = $probs[$obs_hets];
+    for (my $i = $obs_hets + 1; $i <= $rare; $i++) {
+	$p_hi += $probs[$i];
+    }
+    my $p_low = $probs[$obs_hets];
+    for (my $i = $obs_hets - 1; $i >= 0; $i--) {
+	$p_low += $probs[$i];
+    }
+    return($p_hwe, $p_hi, $p_low);
+} 
+
+
+sub percentile {
+  my ($array, $out, $min, $max) = @_;
+
+
+  open (OUT1, ">", $out);
+  tie my @a, 'Tie::Array::Packed::Number';
+  @a = @{$array};
+
+  tied(@a)->sort;
+  my $low;
+  my $high;
+  foreach my $id (0, 0.5,1,2.5,5,7.5,10,20,30,40,50,60,70,80,90,92.5,95,97.5,99,99.5,100) {
+    print OUT1 $id . " precent percentile: ",  sprintf("%.2f", $a[$#a*$id/100]), "\n";
+    $low = sprintf("%.2f", $a[$#a*$id/100]) if $id == $min; 
+    $high = sprintf("%.2f", $a[$#a*$id/100]) if $id == $max;     
+  }
+  close OUT1;
+  return ($low, $high);
+}
+
+
+sub generateVCF {
+  my ($ref, $readDir, $refdir, $p, $GATK, $Picard, $suf) = @_;
+  
+  my $indexref = $ref . ".nix";
+  system ("novoindex $indexref $ref");
+
+
+    
+  my $al_folder = $refdir . "alignment/";
+  mkdir $al_folder unless -e $al_folder;
+ 
+  my $refname = $1 if basename ($ref) =~ m/(\S+)\.fasta/;
+  my $index_ref = $refdir. $refname . '.dict'; 
+  system ("java -jar  $Picard CreateSequenceDictionary R=$ref O=$index_ref");  
+  system ("samtools faidx $ref");
+  
+  my @lib = <$readDir*_1_final.fastq> or die "Warning! No Input Libraries!\n";
+  foreach my $read1 (@lib) {
+    my $name = $1 if basename($read1) =~ m/(\S+)_1_final/;
+
+    my $sorted_in_target_bams = $al_folder . $name . "_sorted";
+    my $sorted = $sorted_in_target_bams. '.bam';
+
+    
+    if ($suf eq 'pe') {
+    my $read2 = $read1; $read2 =~ s/_1_final/_2_final/;
+    my $readS = $read1; $readS =~ s/_1_final/_Unpaired_final/;
+      
+
+    system("novoalign -R 30  -t 150 -d $indexref -f $read1  $read2  -i PE 500, 50 -F STDFQ -o SAM > outPairedSam1");
+    system("novoalign -R 30  -t 150 -d $indexref -f $readS  -F STDFQ -n 500 -o SAM > outSoloSam1");
+
+
+
+    system("grep -v ZS:Z:NM outPairedSam1 | grep -v NH:i: > paired_in_target.sam");
+    system("grep -v ZS:Z:NM outSoloSam1 | grep -v NH:i: > solo_in_target.sam");
+    
+    system("samtools view -bhS paired_in_target.sam >  paired_in_target.bam");
+    system("samtools view -bhS solo_in_target.sam > solo_in_target.bam");
+    
+    
+    system("samtools merge raw.bam paired_in_target.bam solo_in_target.bam");
+    
+    system("samtools sort raw.bam $sorted_in_target_bams");
+    
+    system("samtools index $sorted");  
+    
+    system("rm outPairedSam1 outSoloSam1 paired_in_target.sam solo_in_target.sam paired_in_target.bam solo_in_target.bam raw.bam"); 
+  
+   
+    }
+    
+    if ($suf eq 'se') {
+  
+      system("novoalign -R 30  -t 150 -d $indexref -f  $read1  -F STDFQ -n 250 -o SAM > outSoloSam1");
+      
+      system("grep -v ZS:Z:NM outSoloSam1 | grep -v NH:i: > solo_in_target.sam");
+      
+     
+      system("samtools view -bhS solo_in_target.sam > solo_in_target.bam");
+   
+      
+      system("samtools sort solo_in_target.bam $sorted_in_target_bams");
+      
+      system("samtools index $sorted");  
+      
+      system("rm outSoloSam1 solo_in_target.sam  solo_in_target.bam"); 
+      
+    }
+        
+   
+    my $addgroupbam = $al_folder . $name . ".rg.bam"; 
+    system("java -Xmx2g -jar $Picard AddOrReplaceReadGroups INPUT=$sorted OUTPUT=$addgroupbam RGID=$name RGLB=RAD RGPL=illumina RGPU=lane1 RGSM=$name");
+    my $addgroupbamsort = $al_folder . $name . "_sorted";
+    my $addgroupbamsorted = $addgroupbamsort . ".bam";
+    system("samtools sort $addgroupbam $addgroupbamsort");
+    system("samtools index $addgroupbamsorted");    
+
+    my $intervals = $al_folder . $name .".intervals";
+    system ("java -Xmx2g -jar $GATK -T RealignerTargetCreator -R $ref -I $addgroupbamsorted -o $intervals");
+    my $final = $al_folder . $name . ".bam";
+    my $final_sort = $al_folder . $name . "_sorted";
+    system ("java -Xmx2g -jar $GATK -I $addgroupbamsorted -R $ref -T IndelRealigner -targetIntervals $intervals -o $final");
+    unlink ($sorted, $addgroupbam, $addgroupbamsorted, $intervals);
+  
+    system ("samtools sort $final $final_sort");
+    my $final_sorted = $al_folder . $name . "_sorted.bam";
+    
+    system ("rm $al_folder$name*.bai $final ");
+    system ("samtools index $final_sorted");
+    
+    
+  }
+  system ("rm $refdir*.bt* $refdir*.dict*" );
+  my $raw = $refdir . "raw.vcf";
+  system ("samtools mpileup -s -Q 20 -A -t DP,SP -d 100000 -E -ugf $ref  $al_folder*bam | bcftools call -c -p 0.1 - > $raw ");
+  return ($raw);
+}
+
+
+sub MakePopRef {
+  my ($resdir, $dir, $missing, $sample,$t,$len, $numT) = @_;
+  
+  my $cont = $resdir . "combined1"; 
+  
+  system (" cat $dir*unfiltered.fasta > $cont ");
+  
+  my $contFinal = $resdir . "Reference.fasta";
+  amongCdhit($cont, $contFinal, $sample, $missing, $t, $len, $numT);
+    
+  #unlink ($cont);
+  return ($contFinal);
+  
+}
+
+sub amongCdhit {
+  my ($cont, $contFinal, $sample, $missing, $threhold, $len, $process) = @_;
+
+  my $missample = sprintf("%.0f", $missing * $sample);
+
+  my $call1 = system("cd-hit-est -i $cont -o $contFinal -M 0 -c $threhold -l $len -d 100  -B 1 -n 8 -T $process");
+  
+  my $cluster = $contFinal  . ".clstr";
+  
+  open (IN, "<", $cluster);
+  my %Ucluster;
+  my $id;
+  my $seq;
+  my %ddd;
+  while (<IN>) {
+    chomp (my $line = $_);
+    
+    if ($line =~ m /^(>\S+\s\d+)/) {
+      %ddd = ();
+      $id = $1;
+      $seq = "NA";
+    }
+    else {
+      chomp (my @a = split/\s+/, $line);
+      my $idddd = $1 if $line =~ />(\S+)\.\.\./;
+      $ddd{$idddd}++ if ! $ddd{$idddd} ;
+      
+      if ($line =~ m/\*$/) {
+	$seq = $1 if $line =~ />(\S+)\.\.\./;
+      }
+      if (scalar keys %ddd  >= $missample) {
+	$Ucluster{$seq} ++ if !$Ucluster{$seq};
+      }
+    }  
+  } 
+  close IN;
+
+  my $final_cluster =  $cont . ".final" ;
+  open (OUT, ">", $final_cluster);
+  open (IN, "<", $contFinal);
+
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ />(\S+)/){
+      my $ids = $1;
+      if ($Ucluster{$ids}) {
+        print OUT ">", $ids , "\n";    
+	chomp (my $seq = <IN>);
+	print OUT $seq , "\n";
+      	 }
+      } 
+
+    }
+    close IN;    
+
+  close OUT;
+   
+  system ("mv $final_cluster  $contFinal");
+ # system ("rm $contFinal*.c* ");
+  
+}
+
+
+#########################################################################
+#########################################################################
+#########################################################################
+#########################################################################
+#########################################################################
+
+
+
+sub phyloRadOut {
+  die(qq/
+RADTools phyloRadOut [options] 
+
+Basic options:
+-aln             DIR                  A folder with all individual alignments (locus1.aln, 
+                                      locus2.aln, locus3.aln...)
+-snp             DIR                  A folder with all individual snp files (locus1_SNP, 
+                                      locus2_SNP, locus3_SNP...)
+-geno            DIR                  A folder with all individual genotype files (locus1_geno, 
+                                      locus2_geno, locus3_geno...)
+-sample          INT                  Nimber of samples
+-resDir          DIR                  Results folder
+-out             INT...               Options for output files (e.g. 1 2 4 6): 
+                                      1 - phylip for raxml
+                                      2 - SNAPP
+                                      3 - Splitstree
+                                      4 - STRUCTURE
+                                      5 - SmartPCA
+                                      6 - Dxy
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Other options:
+-informative                          For out = 2,4 only keep informative sites [null]
+-random                               For out = 2,4 random pick one snp per locus [null]
+-popInfo                              For out = 4   Population information (sampleid popid)
+-missing                              For out = 2,4 missing data allowed to keep a SNP [0.2]
+-het                                  For out = 2,4 maximum proportion of shared 
+                                                    polymorphic sites in a locus   [0.2]
+
+                              
+\n\n/) unless (@ARGV);
+  my %opts = (missing => [0.2], het=> [0.2] );
+  my ($aln, $out, $sample, $res, $snp, $geno, $resDir, $popInfo) = (undef, undef, undef,undef,undef,undef, undef,undef);
+  my $informative;
+  my $random;
+  
+  GetOptions('out=s@{1,}' => \$out, 'aln=s@{1,1}' => \$aln, 'snp=s@{1,1}' => \$snp, 'geno=s@{1,1}' => \$geno, 'sample=s@{1,1}' => \$sample,'popInfo=s@{1,1}' => \$popInfo, 'resDir=s@{1,1}' => \$resDir, 'informative'  => \$informative, 'random' => \$random, 'missing=s@{1,1}' => \$opts{missing}, 'het=s@{1,1}' => \$opts{het});
+    
+  my $alndir = dir ($aln);
+  my $snpdir = dir ($snp); 
+  my $genodir = dir ($geno); 
+  my $resdir = dir ($resDir);
+  mkdir $resdir unless -e $resdir;
+  
+  my $species = @{$sample}[0];   
+  my $mis = $opts{missing}[0];
+  my $hets = $opts{het}[0];
+  my $pop = @{$popInfo}[0];
+  
+  print "\nNow produce output files...\n";
+  
+  foreach my $k (@{$out}) {
+    if ($k == 1) {
+      print "\nNow it is producing phylip input files for RaxMl!\n";
+      
+      raxml ($alndir, $species, $resdir);
+    }
+    if ($k == 2) {
+      print "\nNow it is producing nexus input files for SNAPP!\n";
+      if ($random && $informative) {
+	print "\n\nYou are keeping one random informative SNP per RAD for SNAPP!\n\n";
+	SNAPP ($snpdir, $species, $mis, "ri", $hets, $resdir);
+      }
+      if ($random && !$informative) {
+	print "\n\nYou are keeping one random SNP per RAD for SNAPP even it is non-informative!\n\n";
+	SNAPP ($snpdir, $species, $mis, "r",$hets, $resdir);
+      }
+      if (!$random && $informative) {
+	print "\n\nYou are keeping all informative snps for SNAPP!\n\n";
+	SNAPP ($snpdir, $species, $mis,"i", $hets, $resdir);
+      }
+      if (!$random && !$informative) {
+	print "\n\nYou are keeping all snps for SNAPP?!\n\n";
+	SNAPP ($snpdir, $species, $mis,"a",$hets, $resdir);
+      }	 
+    }
+    if ($k == 3) {
+      Splitstree ($snpdir, $species);
+    }
+    if ($k == 4) {
+       print "\nNow it is producing input files for Structure!\n";
+      if ($random && $informative) {
+	print "\n\nYou are keeping one random informative SNP per RAD for Structure!\n\n";
+	Structure ($snpdir,$genodir, $species, $mis, "ri", $hets, $resdir, $pop);
+      }
+      if ($random && !$informative) {
+	print "\n\nYou are keeping one random SNP per RAD for Structure even it is non-informative!\n\n";
+	Structure ($snpdir, $genodir, $species, $mis, "r",$hets, $resdir,$pop);
+      }
+      if (!$random && $informative) {
+	print "\n\nYou are keeping all informative snps for Structure!\n\n";
+	Structure ($snpdir, $genodir, $species, $mis,"i", $hets, $resdir,$pop);
+      }
+      if (!$random && !$informative) {
+	print "\n\nYou are keeping all snps for Structure?!\n\n";
+	Structure ($snpdir, $genodir, $species, $mis,"a",$hets, $resdir,$pop);
+      }
+    }
+    if ($k == 5) {
+      pca ($snpdir, $species);
+    }
+    if ($k == 6) {
+      dxy ($snpdir, $species);
+    } 
+  }
+  
+}
+ 
+ 
+sub Structure {
+  my ($snpdir, $res, $number, $missing, $flag, $het, $res2, $pop) = @_;
+   my %genos = ('AA' => 0 , 'AC' => 1, 'CA'=>1, 'AG' => 2, 'GA' => 2,  'AT' => 3, 'TA'=>3, 'CC'=> 4, 'CG'=>5, 'GC'=>5, 'CT' => 6, 'TC' => 6, 'GG'=>7, 'GT'=>8, 'TG'=>8, 'TT'=>9, 'NN' => -9);
+  # A = 1, C = 2, G = 3, T = 4
+  my %genos2 = ('0' => ['1','1'], '1' => ['1','2'], '2' => ['1','3'], '3' => ['1','4'], '4'=>['2','2'], '5'=>['2','3'], '6' => ['2','4'], '7'=>['3','3'], '8'=>['3','4'], '9'=>['4','4'], '-9' => ['-9','-9'] );
+  
+  my $resdir = $res2 . "StructureInput/";
+  mkdir $resdir unless -e $resdir;
+
+  my $nondir = $1 . 'Individual_Non_diallelic/' if $res =~ /(\S+)Individual/; ##
+  my %non;
+  my $allnon = $resdir . "all_nondi";
+  system ("cat $nondir*Non_diallelic_SNPID.txt > $allnon");
+  open (NON, "<", $allnon);
+  while (<NON>) {
+    chomp (my @line = split /\s+/,$_);
+    $non{$line[0]}{$line[1]}++;
+  }
+  close NON;
+  unlink ($allnon);
+
+  
+  my @geno = <$res*_geno>;
+  my $sample = $res."sampleID.txt";
+  my $out = $resdir ."Final_Structure.txt";
+  my @snp = <$snpdir*_SNP>; 
+  my $file = $resdir . "Final_geno4.txt";
+  open (OUT, ">", $file);
+  
+  foreach (@geno) {
+    my $file = $_;
+    my $locus = $1 if basename($file) =~ /(locus\d+)_geno/;  
+    open (IN, "<", $file);
+    my $d = 1;  
+    while (<IN>) {
+      chomp (my $line = $_);
+      print OUT $locus, "\t", $d, "\t", $line, "\n";
+      $d++;
+    }
+    close IN;
+  }
+  close OUT;
+ 
+  my %geno_hash;
+  open (GENO, "<", $file);
+  while (<GENO>) {
+    chomp (my @a = split /\s+/, $_);
+    $geno_hash{$a[0]}{$a[1]} = join ("\t",@a[2..$#a]); 	
+  }
+  close GENO;
+  
+
+  my $snptmp = 'tmp';
+  open (OUT, ">", $snptmp );
+  foreach (@snp) {
+    my $file = $_;
+    my $locus = $1 if basename($file) =~ /(locus\d+)_SNP/;  
+    open (IN, "<", $file);
+    my $d = 1;  
+    while (<IN>) {
+      chomp (my $line = $_);
+      print OUT $locus, "\t", $d, "\t", $line, "\n";
+      $d++;
+    }
+    close IN;
+  }
+  close OUT;
+  
+ 
+  open (IN, "<", $snptmp);
+  my %hash;
+  my @ind;  
+  while (<IN>) {
+    chomp (my @line = split /\s+/,$_);
+    my $geno =join('',@line[2 .. $#line]);
+    $geno =~ s/-1/?/g;
+    my @miss = ($geno =~ m/\?/g);
+    my @het = ($geno =~ m/1/g);
+    my @homR =  ($geno =~ m/0/g);
+    my @homA =  ($geno =~ m/2/g);
+    if ($flag eq 'ri' || $flag eq "i") {  
+      if (scalar(@homA) + scalar(@het) > 1 && scalar(@homR) > 0 ) {
+	if (scalar(@het)/$number <= $het && scalar(@miss)/$number <= $missing && !$non{$line[0]}{$line[1]}) {
+	    $hash{$line[0]}{$line[1]} = $geno_hash{$line[0]}{$line[1]};  
+	}
+      }
+    }
+    
+    if ($flag eq 'r' || $flag eq "a") {
+      if ( scalar(@homR) > 0 ) {
+	if (scalar(@homA) > 0 || scalar(@het) > 0) {
+	  if (scalar(@het)/$number <= $het && scalar(@miss)/$number <= $missing && !$non{$line[0]}{$line[1]}) {
+	    $hash{$line[0]}{$line[1]} = $geno_hash{$line[0]}{$line[1]};  
+	  }
+	}
+      } 
+    }
+  }
+  close IN;
+
+  
+  if ($flag eq 'r' || $flag eq 'ri') {
+    my $selected = $resdir . "selected_one_SNP_per_Contig_for_structure.txt";
+    my $selected1 = random (\%hash, $resdir,$selected);
+    
+    open (IN2, "<", $selected1);
+    my $n = 0;
+    while (<IN2>) {
+      $n++;
+    }
+    close IN2;
+    
+    print "The number of selected sites selected for structure analyses is: ", $n, "\n";
+    
+    print "\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+    
+    my $out1 =  $resdir . "cleaned";
+    trim($number, $selected1, $out1, \%genos);
+    my $out2= 'converted';
+    transpose($out1, $number, $n, $out2);
+    convert($out2, $out, \%genos2, $pop);
+    unlink ($out1, $out2);
+  }
+  if ($flag eq 'a' || $flag eq 'i') {
+    my $selected1 = $resdir . "selected_ALL_SNP_chosen_for_structure.txt";
+    open (O, ">", $selected1);
+    my $head = $resdir . "head";
+    open (OUT, ">", $head);
+    print OUT "IndID\tPopID\t";
+    
+    
+    my $n = 0;
+    for my $locus (sort {$a cmp $b} keys %hash){
+      my $dd = -1;
+      print OUT $dd, "\t";
+      for my $pos (sort {$a <=> $b} keys %{$hash{$locus}}){
+	$dd++;
+	print O $locus, "\t", $pos, "\t", $hash{$locus}{$pos},"\n";
+	print OUT $dd, "\t";
+	$n++;
+      }
+    }
+    print OUT "\n";
+    close O;
+    close OUT;
+    
+    print "The number of selected sites selected for structure analyses is: ", $n, "\n";
+    
+    print "\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+    
+    my $out1 =  $resdir . "cleaned";
+   
+    trim($number,$selected1, $out1,\%genos);
+    my $out2= 'converted';
+    transpose($out1, $number, $n, $out2);
+    convert($out2, $out, \%genos2, $pop);
+    my $tmp = $resdir . "tmp";
+    system ("cat $head $out > $tmp");
+    system ("mv $tmp $out");
+    
+    unlink ($out1, $out2);
+  }  
+}
+
+sub convert {
+  my ($file, $final, $genos2,$pop) = @_;
+  my %genos2 = %{$genos2};
+  open (IN, '<', $file);
+  open (OUT,'>', $final);
+  
+  open (POP, '<',$pop);
+  my $d = 1;
+  my %pop;
+  foreach (<POP>) {
+    chomp(my @line = split /\t/, $_);
+    $pop{$d} = $line[1];
+    $d++;
+  }
+  my $i = 1;
+  foreach (<IN>) {
+    my @array1;
+    my @array2;
+    
+    chomp (my @line = split /\s+/, $_);
+    
+    foreach my $gene (@line) {
+      push (@array1, "\t", $genos2{$gene}[0]);
+    }
+    print OUT $i, "\t", $pop{$i}, @array1, "\n";
+    foreach my $gene2 (@line) {
+      push (@array2, "\t",$genos2{$gene2}[1]);
+    } 
+    print OUT $i,"\t", $pop{$i}, @array2, "\n";
+    $i++;
+  }
+  unlink ($file);
+  
+}
+
+
+sub trim{
+    my ($sample, $file, $out, $genos) = @_;
+  my %genos = %{$genos};
+  open (GENOPROB, '<', $file); 
+  open (OUT, ">", $out);
+  foreach (<GENOPROB>) {
+    my @geno = split /\s+/, $_; 
+    for (my $i = 2; $i<=$sample ;$i++) {
+     print  OUT $genos{$geno[$i]}, "\t";
+    }
+    print OUT  $genos{$geno[$sample+1]},"\n";
+  }
+  close GENOPROB;
+  close OUT;
+  #unlink ($file);
+}
+
+sub random {
+  my ($hash, $dir, $selected) =@_;
+  my %hash =%{$hash};
+  open (OUT, ">", $selected);
+  my @final;
+  foreach my $id (sort {$a cmp $b} keys %hash) {    
+    my @array = (); 
+    foreach my $pos (sort {$a <=> $b} keys %{$hash{$id}}){
+      push (@array, $pos);
+    } 
+    my $randomelement = $array[rand @array];    
+    print OUT $id, "\t", $randomelement, "\t", join("\t",$hash{$id}{$randomelement}), "\n" if ($randomelement);  
+  } 
+  close OUT;
+  return $selected;
+}
+
+
+sub dir {
+  my ($b) = @_;
+  my @a = @{$b};
+  my $dir;
+  if ($a[0] =~ m/\/$/ ){
+    $dir= $a[0]; 
+  }
+  else {
+    $dir = $a[0] . "/";
+  }
+  return $dir;
+}
+
+
+sub SNAPP {
+  my ($res, $number, $missing, $flag, $het, $res2) = @_;
+
+  my $resdir = $res2 . "SNAPPInput/";
+  mkdir $resdir unless -e $resdir;
+
+  my $nondir = $1 . 'Individual_Non_diallelic/' if $res =~ /(\S+)Individual/; ##
+  my %non;
+  my $allnon = $resdir . "all_nondi";
+  system ("cat $nondir*Non_diallelic_SNPID.txt > $allnon");
+  open (NON, "<", $allnon);
+  while (<NON>) {
+    chomp (my @line = split /\s+/,$_);
+    $non{$line[0]}{$line[1]}++;
+  }
+  close NON;
+  unlink ($allnon);
+     
+  my @SNP = <$res*_SNP>;
+  my $sample = $res."sampleID.txt";
+  my $out = $resdir. "Final_SNAPP";
+
+  my $file = $resdir . "Final_geno2.txt";
+  open (OUT, ">", $file);
+  
+  foreach (@SNP) {
+    my $file = $_;
+    my $locus = $1 if basename($file) =~ /(locus\d+)_SNP/;  
+    open (IN, "<", $file);
+    my $d = 1;  
+    while (<IN>) {
+      chomp (my $line = $_);
+      print OUT $locus, "\t", $d, "\t", $line, "\n";
+      $d++;
+    }
+    close IN;
+  }
+  close OUT;
+ 
+ 
+  open (IN, "<", $file);
+  my %hash;
+  my @ind;  
+  while (<IN>) {
+    chomp (my @line = split /\s+/,$_);
+    my $geno =join('',@line[2 .. $#line]);
+    $geno =~ s/-1/?/g;
+    my @miss = ($geno =~ m/\?/g);
+    my @het = ($geno =~ m/1/g);
+    my @homR =  ($geno =~ m/0/g);
+    my @homA =  ($geno =~ m/2/g);
+    if ($flag eq 'ri' || $flag eq "i") {  
+      if (scalar(@homA) + scalar(@het) > 1 && scalar(@homR) > 0 ) {
+	if (scalar(@het)/$number <= $het && scalar(@miss)/$number <= $missing && !$non{$line[0]}{$line[1]}) {
+	    $hash{$line[0]}{$line[1]} = $geno;	  
+	}
+      }
+    }
+    
+    if ($flag eq 'r' || $flag eq "a") {
+      if ( scalar(@homR) > 0 ) {
+	if (scalar(@homA) > 0 || scalar(@het) > 0) {
+	  if (scalar(@het)/$number <= $het && scalar(@miss)/$number <= $missing && !$non{$line[0]}{$line[1]}) {
+	    $hash{$line[0]}{$line[1]} = $geno;
+	  }
+	}
+      } 
+    }
+  }
+  close IN;
+ 
+  open (ID, "<", $sample);  
+  while (<ID>) {
+    chomp (my $line = $_);
+    push (@ind, $line);
+  }
+  close ID;
+  
+  if ($flag eq 'r' || $flag eq 'ri') {
+    my $selected = $resdir . "selected_one_SNP_per_Contig_for_SNAPP.txt";
+    my $selected1 = random (\%hash, $resdir, $selected);
+    nexus (\@ind, $selected1, $out, $number,$resdir);
+  }
+  if ($flag eq 'a' || $flag eq 'i') {
+    my $selected1 = $resdir . "selected_ALL_SNP_chosen_for_SNAPP.txt";
+    open (O, ">", $selected1);
+    for my $locus (sort {$a cmp $b} keys %hash){
+      for my $pos (sort {$a <=> $b} keys %{$hash{$locus}}){
+	print O $locus, "\t", $pos, "\t", $hash{$locus}{$pos},"\n";
+      }
+    }
+    close O;
+    nexus (\@ind, $selected1, $out, $number, $resdir);    
+  }
+  
+}  
+
+
+ sub nexus {
+    my ($indinfo, $selected, $final, $sample, $resdir) = @_;
+    my @ind = @{$indinfo};
+    
+    open (IN, "<", $selected);
+    open (OUT, ">", "trimmed");
+    my $n =0;
+    while (<IN>) {
+      
+      chomp(my @line = split /\s+/, $_);
+      print OUT (join "\t", @line[2..$#line]), "\n";
+      $n++;   
+    }
+    close IN; 
+    close OUT;  
+    print "The number of selected sites for SNAPP is: ", $n, "\n";
+    print "\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+    
+    my $out = 'transposed';
+    open (OUT1, '>', $out);
+    
+    for (my $i = 1; $i <= $sample; $i++) {
+      my $count = $n;
+      open (IN1, '<', 'trimmed');
+      foreach (<IN1>) {
+	chomp();	  
+	if ($count > 1) {
+	  my @line = split //, $_;
+	  print OUT1 $line[$i-1], "\t";
+	  $count--;
+	}
+	elsif ($count == 1) {
+	  my @line = split //, $_;
+	  print OUT1 $line[$i-1], "\n";
+	}
+	else {
+	  last;
+	}
+      }
+    }
+    close IN1;
+    close OUT1;
+    
+    open (IN, "<", 'transposed');
+    my $results =  $final . ".nexus";
+
+    open (OUT, ">", $results);
+    
+    print OUT "#NEXUS", "\n\n";
+    print OUT "Begin data;", "\n";
+    print OUT "\tDimensions ntax=$sample nchar=$n;","\n";
+    print OUT "\tFormat symbols=","\"012\""," missing=?;","\n";
+    print OUT "\tMatrix","\n\n"; 
+    my $a = 0;
+    
+    while (<IN>) {
+      chomp (my @line = $_);
+      my @d = split /\s+/, $line[0];
+      print OUT $ind[$a], "\t", @d, "\n";
+      $a++;
+    }
+    print OUT "\t", ";","\n";
+    print OUT "End;", "\n";
+    system("rm trimmed transposed");
+  }
+
+
+
+sub raxml {
+  my ($dir, $sample, $res2) = @_;
+  my @aln1 = <$dir*.aln>;
+  my $resdir = $res2 . "raxmlInput/";
+  mkdir $resdir unless -e $resdir;
+  
+  my %aln;  
+  foreach (@aln1) {
+    my $file = $_;
+    my $locus = $1 if basename($file) =~ /locus(\d+)\.aln/;
+    open (IN, "<", $file);
+    my $ids;
+
+    while (<IN>) {
+      chomp (my $line = $_);    
+      if ($line =~ m/^>(\S+)/ ) {
+	$ids = $1;	
+      }      
+      else {		
+      $aln{$ids}{$locus} .= $line;
+     }
+    }
+    close IN;
+  } ## foreach (@aln1)
+ 
+  
+  ##raxml ouput:
+  my $out = $resdir . "Final_alignment.phylip";
+  my $par =  $resdir . "Final_alignment_Partition.txt";
+  
+  my $all;
+  open (OUT, ">", $out);
+  open (PAR, ">", $par);
+  
+  my $c = 0;
+  foreach my $s (sort {$a cmp $b} keys %aln) {
+    foreach my $contig (sort {$a <=> $b} keys %{$aln{$s}}) {
+      print PAR "locus", $contig, " = ";
+      print PAR $c+1, "-", $c+length ($aln{$s}{$contig}), "\n";
+      $c += length ($aln{$s}{$contig});
+      $all += length ($aln{$s}{$contig});
+    }
+    last;
+  } ## foreach my $s (sort {$a cmp $b} keys %aln) {
+  close PAR;
+  print "\nThe total length of the alignment is: ", $all, "bp!", "\n"; 
+  
+  print OUT $sample, " ", $all,"\n";
+  foreach my $s (sort {$a cmp $b} keys %aln) {
+    my $total;    
+    print OUT $s, " ";
+    #my $name_space = length ($sample) + 1;
+    foreach my $contig (sort {$a <=> $b} keys %{$aln{$s}}) {
+      $total .= $aln{$s}{$contig};
+    } 
+    print OUT " ", $total, "\n";
+  } ##foreach my $s (sort {$a cmp $b} keys %aln) {
+  close OUT;
+  
+  print "\nthe total number of loci in the nexus matrix is: ", scalar (@aln1), "!", "\n";
+  
+  print "\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+  
+  
+} ##sub raxml
+
+
+#########################################################################
+#########################################################################
+#########################################################################
+#########################################################################
+#########################################################################
+
+
+sub phyloRad {
+  die(qq/
+
+RADTools pyhloRad [options] 
+
+options:
+
+-a     DIR      A folder with all filtered RAD files (AAA.filtered.fasta, 
+                BBB.filtered.fasta, CCC.filtered.fasta...)
+-b     FILE     A txt file that contains names of libraries that you want 
+                to align together, one name per line, order matters
+-m     FLOAT    Percent missing data defined as no data [0.3]
+-n     FLOAT    Percent individuals that fail to pass -m filter 
+                defined as missing loci [0.3]
+-l     FLOAT    l th percentile to trim off loci with extremely low depth [2.5]
+-h     FLOAT    h th percentile to trim off loci with extremely high depth [97.5]
+-H     FLOAT    H th percentile to trim off loci with extremely high average heterozygosity [97.5]
+-z     FLOAT    Maximum proportion of shared polymorphic sites in a locus [0.2]
+-s     INT      number of samples
+ 
+
+\n\n/) unless (@ARGV);
+  
+  my %opts = (a=>undef,b=>undef, m=>0.3, n=>0.3, s=>undef, l=>2.5, h=>97.5, H=>97.5, z=>0.2);
+  getopts('a:b:m:n:s:l:h:H:z:', \%opts);
+  
+  my $dir;
+  
+  if ($opts{a} =~ m/\/$/ ){
+    $dir = $opts{a}; 
+  }
+  else {
+    $dir = $opts{a} . "/";
+  }
+  
+  my $refdir = $dir . "alignment/";
+  mkdir $refdir unless -e $refdir;
+
+  my $missingData = $opts{m}; 
+  my $missingLoci = $opts{n};
+  my $sample = $opts{s};  
+  my $name =  $opts{b} or die " please provide library name file!\n\n ";
+  
+  my $lowper = $opts{l};  
+  my $highper = $opts{h}; 
+  my $highH = $opts{H};
+  my $het =  $opts{z};
+  
+  print "\nNow looking for orthologous markers...\n";
+  MakeAlignment ($refdir, $dir, $name, $missingData, $missingLoci, $sample, $lowper, $highper, $highH,$het);
+  
+  print "\nProgram finished successfully!\n\n";
+  
+}
+
+sub MakeAlignment {
+  my ($resdir, $dir, $file, $missingData, $missingLoci, $sample, $min, $max,  $H,$het) = @_;
+  
+  my $misDir = $resdir . "missingData_filtered/";
+  mkdir $misDir unless -e $misDir;
+  
+  my $covDir = $resdir . "Coverage_filtered/";
+  mkdir $covDir unless -e $covDir;
+  
+  my $hDir = $resdir . "IndividualH_filtered/";
+  mkdir $hDir unless -e $hDir;
+  
+  my $hetDir = $resdir . "HetSites_filtered/";
+  mkdir $hetDir unless -e $hetDir;
+
+  
+  my $chDir = $resdir . "CoverageANDIndividualH_filtered/"; ####
+  mkdir $chDir unless -e $chDir;###
+  
+  my %genos = ('Y' => '1' , 'M' => '1', 'R'=> '1', 'S' => '1', 'K' => '1',  'W' => '1', 'A'=> '2', 'C'=> '2', 'T'=> '2', 'G'=> '2', 'N' => '-1', '-' => '-1');
+  my %genos2 = ('Y' => 'CT' , 'M' => 'AC', 'R'=>'AG', 'S' => 'GC', 'K' => 'GT',  'W' => 'AT', 'A'=> 'AA', 'C'=> 'CC', 'T'=> 'TT', 'G'=> 'GG', 'N' => 'NN', '-' => 'NN');
+  my %genos3 = ('Y' => ['C','T'] , 'M' => ['A','C'], 'R'=>['A','G'], 'S' => ['G','C'], 'K' => ['G','T'],  'W' => ['A','T'], 'A'=> ['A','A'], 'C'=> ['C','C'], 'T'=> ['T','T'], 'G'=> ['G','G'], 'N' => ['N','N'], '-' => ['N','N']);
+
+  
+  my $start1 = time;
+  my $new_master = $resdir . "combined_filtered.fasta"; 
+  my $new_H = $resdir . "combined_individual_H.txt"; 
+  my $new_cov = $resdir . "combined_individual_cov.txt"; 
+  
+  system (" cat $dir*filtered.fasta > $new_master ");
+  system (" cat $dir*individual_H.txt > $new_H ");
+  system (" cat $dir*RAD_loci_depth.txt > $new_cov ");
+  
+  my $new_master1 = $new_master . "_copy";
+  system ("cp $new_master $new_master1" );
+  my $blastout = $resdir .  'AllSample.blast.out';
+  my $call1 = system("makeblastdb -in $new_master -dbtype nucl  > log");
+  
+  my $call2 = system("blastn -db $new_master -query $new_master1 -evalue 1e-10 -outfmt 6 -out $blastout");
+  system("rm $new_master.n* $new_master1 log");
+  
+  
+  
+  my %name;
+  my $d=1;
+  open (NAME, "<", $file);
+  while (<NAME>) {
+    chomp (my $line = $_);
+    unless (/^$/) {
+      $name{$d} = $line;
+      $d++;
+    }
+  }
+  close NAME;
+  $d = $d-1;
+  
+  my $hash = seqhash($new_master);
+  my %Preseq = %{$hash};
+   
+  unlink ($new_master);
+  
+  
+  ###now combine all individual H
+  my %h;
+  open (IN, "<", $new_H);
+  while (<IN>) {
+    chomp (my @a = split /\s+/, $_);
+    my $id = $1 if $a[0] =~ /^>(\S+)/;
+    $h{$id} = $a[1];
+  }
+  close IN;
+  unlink ($new_H);
+  ### now combine all individual gene coverage
+  
+  my %cov;
+  open (IN, "<", $new_cov);
+  while (<IN>) {
+    chomp (my @a = split /\s+/, $_);
+    my $id = $1 if $a[0] =~ /(\S+)/;
+    $cov{$id} = $a[1];
+  }
+  close IN;
+  unlink ($new_cov);
+ 
+  
+  open (IN, "<", $blastout);
+  my %data;
+  my %seq;
+  #print scalar keys %Preseq, "\n";
+  while (<IN>) {
+    chomp (my @a = split /\s+/, $_);
+    my $lib =$1 if $a[1] =~ m/(\S+)_locus\d+/;
+
+    my $id1 = $a[1];
+    my $id0 = $a[0];
+    if ($a[8] > $a[9]) {
+      $seq{$id1}{'seq'} = reverse($Preseq{$id1}{'seq'}) if $Preseq{$id1};
+      $seq{$id1}{'seq'} =~ tr/ATGC/TACG/ if $Preseq{$id1};
+      $seq{$id1}{'len'} = $Preseq{$id1}{'len'} if $Preseq{$id1};
+      
+      $seq{$id0}{'seq'} = $Preseq{$id0}{'seq'} if $Preseq{$id0};
+      $seq{$id0}{'len'} = $Preseq{$id0}{'len'} if $Preseq{$id0};
+      
+      delete $Preseq{$id1} if $Preseq{$id1};
+      delete $Preseq{$id0} if $Preseq{$id0};
+    }
+    else {
+      $seq{$id0}{'seq'} = $Preseq{$id0}{'seq'} if $Preseq{$id0};
+      $seq{$id0}{'len'} = $Preseq{$id0}{'len'} if $Preseq{$id0};
+      
+      $seq{$id1}{'seq'} = $Preseq{$id1}{'seq'} if $Preseq{$id1};
+      $seq{$id1}{'len'} = $Preseq{$id1}{'len'} if $Preseq{$id1};
+      
+      delete $Preseq{$id1} if $Preseq{$id1};
+      delete $Preseq{$id0} if $Preseq{$id0};
+    }
+
+    
+
+    push @{$data{$a[0]}}, {'gene' => $a[1], 'library' => $lib};  
+  }
+  close IN;
+
+  
+  #print  scalar keys %seq, "\n";
+  unlink ($blastout);
+
+  
+  my %alldata;
+  my $number = 1;
+  my $missing;
+  foreach my $d (sort {$a cmp $b} keys %data) { 
+    if ($data{$d} ) {
+      my %seen;
+      for (my $i = 0 ; $i < scalar @{$data{$d}}; $i++ ) {
+	if (!$seen{$data{$d}[$i]{'gene'}}++ ) {
+	  push @{$alldata{$number}}, $data{$d}[$i]{'gene'};
+	  delete $data{$data{$d}[$i]{'gene'}} if ($data{$d}[$i]{'gene'} ne $d);
+	}
+      }
+      delete $data{$d} if $data{$d};
+      
+      
+      my $muscle_in = $resdir . "locus" . $number;
+      open (MUSIN, ">", $muscle_in );
+      
+      
+      foreach my $d (sort {$a <=> $b} keys %name) {
+	my $yes = 0;
+	my $t;
+	foreach my $present (keys %seen) {
+	  my $lib = $1 if $present =~ m/(\S+)_locus\d+/;
+	  if ($name{$d} eq $lib) {	
+	    print MUSIN ">", $name{$d}, "\n";
+	    print MUSIN $seq{$present}{'seq'}, "\n";
+	    $yes = 1;
+	    last;
+	  }
+	  else {
+	    $t = $present;
+	  }
+	}
+	
+	if ($yes == 0) {
+	  print MUSIN ">", $name{$d}, "\n";
+	  print MUSIN 'N' x $seq{$t}{'len'}, "\n";
+	  
+	}      
+      }
+      close MUSIN;
+      
+      my $muscle_in2 = $resdir . "locus_2_" . $number;
+      open (MI, "<", $muscle_in);
+      open (OUTI, ">", $muscle_in2);
+      while (<MI>) {
+	chomp (my $line = $_);
+	if ($line =~ /^>/) {
+	  print OUTI $line, "\n"
+	}
+	elsif ($line !~ /^N*/ && $line !~ /N$/) {
+	  print OUTI $line, "\n";
+	} 
+	elsif ($line =~ /^N*[A|C|G|T|Y|S|K|R|W|M]+/ || $line =~ /[A|C|G|T|Y|S|K|R|W|M]+N*$/) {
+	  $line =~ s/^N*//g if $line =~ /^N*/;
+	  $line = reverse $line;
+	  $line =~ s/^N*//g if $line =~ /^N*/;
+	  $line = reverse $line;
+	  print OUTI $line, "\n";
+	}
+	else {
+	  print OUTI $line, "\n";
+	}
+      }
+      close MI;
+      close OUTI;    
+      
+      my $muscle_out = $resdir . "locus" . $number . ".aln";;
+      my $muscle_out1 = $resdir . "locus" . $number . ".aln1";
+      #mafft --ep -0.9 --quiet  Contig170.aln
+      
+      #system ("mafft --ep -0.9 --quiet $muscle_in2 > $muscle_out ") ;
+     
+      system ("muscle -in $muscle_in2 -out $muscle_out -quiet ");
+      #system ("muscle -in $muscle_out -out $muscle_out1 -quiet -gapopen -5000");
+      #system ("mv $muscle_out1 $muscle_out ");
+      unlink ($muscle_in, $muscle_in2);
+      $number ++;
+	
+      open (IN, "<", $muscle_out);
+      open (OUT, ">", $muscle_out1);
+      my %gene;      
+      my $id;
+      my $N;
+      while (<IN>) {
+	chomp (my $line = $_);
+	if ($line =~ m/^>(\S+)/) {
+	  $id = $1;
+	  print OUT ">", $id,"\n";
+	}
+	else {
+	  $gene{$id} .= uc ($line);
+	  print OUT uc ($line), "\n";
+	}
+      }
+      close IN;
+      close OUT;
+      
+      system ("mv  $muscle_out1  $muscle_out ");
+
+      
+      my @genearray;
+      foreach my $c (sort {$a cmp $b} keys %gene) {
+	my $seq = $gene{$c};	
+	my $atgc = ($seq =~ s/[ATGCYWRMKS]//ig);
+	push @genearray, $atgc;
+      } 
+      my $maxLen = max (@genearray);
+      my $md = 0;
+      foreach my $c (sort {$a cmp $b} keys %gene) {
+	my $seq = $gene{$c};	
+	my $l = ($seq =~ s/[ATGCYWRMKS]//ig);	
+	my $missing = 1 - $l/$maxLen;
+	$md ++ if ($missing > $missingData);
+      } 
+      system ("mv $muscle_out $misDir ") if ($md/$sample > $missingLoci);
+      $missing++ if ($md/$sample > $missingLoci);
+      my $delete = $1 if $muscle_out =~ /(locus\S+)\.aln/;
+      delete $alldata{$delete} if ($md/$sample > $missingLoci);     
+      delete $alldata{$delete} if ($maxLen <= 50);
+      } ##if ($data{$d} ) {   
+    } ## foreach my $d (sort {$a cmp $b} keys %data) { 
+
+  
+  my $time1 = int((time - $start1)/60);  
+  print "\nAlignment is finished and it took $time1 minutes! But... we need to filter out missing data and potential paralogs!!\n";
+  print "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+  
+  
+  my $percentmissingLoci = (1-$missingLoci)*100;
+  my $percentmissingData =  (1-$missingData)*100;
+  my $missingdata= $missingData*100;
+
+  
+  print "\n", $missing, " loci are defined as missing data by the user!\n" if $missing;
+  print "\n", "In each alignement at least " , $percentmissingLoci, "% of the samples contain no more than ",$missingdata, "% missing data!\n";
+  
+  
+  my %final;
+  
+  my @cov;
+  my @h;
+
+  
+  foreach my $number (sort {$a <=> $b} keys %alldata) {
+    my $sumH;
+    my $sumCOV;
+    my $d;
+    my $c;
+    for (my $i= 0; $i < scalar (@{$alldata{$number}}); $i++) {  
+      if ($h{$alldata{$number}[$i]}) {
+	$sumH += $h{$alldata{$number}[$i]};
+	$d++;
+      }
+       if ($cov{$alldata{$number}[$i]}) {
+	$sumCOV += $cov{$alldata{$number}[$i]};
+	$c++;
+      }     
+    }
+    
+    my $avgH = sprintf("%.2f", $sumH/$d);
+    my $avgCOV =sprintf("%.2f",$sumCOV/$c);
+    
+    push @cov, $avgCOV;
+    push @h, $avgH;
+    $final{$number}{'h'} =  $avgH;  
+    $final{$number}{'c'} =  $avgCOV;
+    
+    } ##foreach my $number (sort {$a <=> $b} keys %alldata) {
+      
+  my $gene_percentile = $resdir . "RAD_AverageDepth_percentile.txt";
+  my $h_percentile = $resdir . "RAD_averageH_percentile.txt";
+  my $gene_depth = $resdir . "RAD_AverageDepth.txt";
+  my $h_each = $resdir . "RAD_averageH.txt";
+  
+  
+  my ($lowper, $highper) = percentile (\@cov, $gene_percentile, $min, $max);
+  my ($lowH, $highH) = percentile (\@h, $h_percentile, '0.5', $H);
+  
+  my %fc;
+  my %fh;
+  my %fch;
+  
+  open (OUT1, ">", $gene_depth);
+  open (OUT2, ">",$h_each);
+  
+  foreach my $id (sort {$a <=>$b} keys %final) {
+    print OUT1 "locus", $id, "\t", $final{$id}{'c'}, "\n";
+    print OUT2 "locus", $id, "\t", $final{$id}{'h'}, "\n";
+    
+    $fc{$id} ++ if ($final{$id}{'c'} < $lowper || $final{$id}{'c'} > $highper);    
+    $fh{$id} ++ if ($final{$id}{'h'} > $highH);  
+    $fch{$id} ++ if ($fc{$id} && $fh{$id});
+    if ($fch{$id}) {
+      delete $fc{$id} if  $fc{$id} ;
+      delete $fh{$id} if  $fh{$id} ;
+    }
+    
+    delete $final{$id} if ($final{$id}{'c'} < $lowper || $final{$id}{'c'} > $highper || $final{$id}{'h'} > $highH );
+  }
+  close OUT1; close OUT2;
+  
+  print "\n", scalar keys %fc, " loci having coverage above ", $max," percentile (", $highper, "X) or below ", $min," percentile (",$lowper,"X) of the statistics!!\n";
+  print "\n", scalar keys %fh, " loci having average individual heterozygosity above ", $H, " percentile (", $highH, ") of the statistics!!\n";  
+  if (scalar keys %fch) {
+    print "\n", scalar keys %fch, " loci show both extreme coverage and average individual heterozygosity!!\n";   
+  }
+  
+  my @aln = <$resdir*aln>;
+  my %fhet;
+  
+  foreach (@aln) {
+    my $file = $_;   
+    my $locus = $1 if basename($file) =~ /locus(\d+)\.aln/;
+    if (! $final{$locus}){
+         system ("mv $file $covDir") if $fc{$locus};
+	 system ("mv $file $hDir") if $fh{$locus};
+	 system ("mv $file $chDir") if $fch{$locus};
+    }
+    
+    if ($final{$locus}) {
+     
+      open (IN, "<", $file);
+      my $i;
+      my %seq;
+      while (<IN>) {
+	chomp (my $line = $_);
+	if ($line =~ /^>(\S+)/){
+	  $i = $1;
+	}
+	else {
+	  $seq{$i}{'length'} +=  length ($line);
+	  $seq{$i}{'seq'} .= $line;
+	}
+      }
+      close IN;
+     
+      my $infile = $resdir . "locus" . $locus . "_tmp1";
+      open (OUT, ">", $infile);
+      my $site = scalar keys %seq;
+      my $seqs;
+     
+      my %seq2 = %seq;
+      my $sampleID = $resdir . "sampleID.txt";
+      open (ID, ">", $sampleID );
+      my $last = 0;
+      foreach my $sample (sort {$a cmp $b} keys %seq2) {
+	print ID $sample, "\n";
+	$last++;
+	last if ($last == $site);
+      }
+      close ID;
+      
+      foreach my $sample (sort {$a cmp $b} keys %seq) { 
+	$seqs = $seq{$sample}{'length'};
+	my @a = split //, $seq{$sample}{'seq'};
+	foreach (@a) {
+	  print OUT $_, "\t";
+	}
+	print OUT "\n";
+      }      
+      close OUT;
+      
+      my $transposed = $resdir . "locus" . $locus . "_tmp"; 
+      transpose ($infile,  $seqs, $site, $transposed);
+     
+      open (TRANS, "<", $transposed);
+      unlink ($infile, $transposed);
+      
+      my $indSNPs =  $resdir . "locus" . $locus . "_SNP";
+      my $indGeno =  $resdir . "locus" . $locus . "_geno";
+      open (SNP, ">", $indSNPs);
+      open (GENO, ">", $indGeno);
+      
+      my $SNP_ID  =  $resdir . "locus" . $locus . "_SNPID.txt"; ##############
+      open (SNPID, ">", $SNP_ID);##############
+      my $dd =1;##############
+      print SNPID "Position\tMajor\tMinor\n";############
+     
+    
+      while (<TRANS>) {
+      my $minor;#############
+      print SNPID $dd, "\t";#############
+      $dd++;#############
+      my @minor;
+      
+        chomp (my @nu = split /\s+/, $_);
+	my @array;	
+	my @nu2 = @nu;
+	my $min_het = 0;
+	
+	foreach (@nu2) {
+	  push @array, $_ if $_ =~ /[A|T|C|G]/;
+	}
+	
+	my ($item, $count) = most_Frequent(\@array) if (@array); 
+        
+                   
+	if (@array) {        
+	  foreach my $site (@nu) {	    
+	    print GENO $genos2{$site}, "\t";  	    
+	    if ($site eq $item ) {
+	      if ($item =~ /[A|T|G|C]/) {  
+                print SNP "0", "\t";
+	      }
+	      else {
+		print "error! major should not be 'N' or '-' !", "\n";
+		exit;
+	      }  
+	    }
+	    else {
+	      $minor = $genos2{$site} if ($site ne 'N' && $site ne '-'); #############PHYLO
+              push @minor, $genos3{$site}[0], $genos3{$site}[1] if ($site ne 'N' && $site ne '-'); ######PHYLO
+           
+	      print SNP $genos{$site}, "\t";
+	      $min_het ++ if ($genos{$site}) eq '1';
+	    }
+	  }
+	  print SNP "\n";
+	  print GENO "\n";          
+          print SNPID $item, "\t";#############
+
+	   if ($minor) {#############
+	    my @unique = uniq (@minor); ################
+	    foreach (@unique) {################
+	      print SNPID $_,"\t" if $_ ne $item;#############
+	    }###############
+	    print SNPID "\n";###########	    
+	  }     #############    
+	  if (!$minor) {#############
+            print SNPID $item, "\n";#############
+	  } #############	  
+	} ##if (@array)
+
+      
+	else {        
+	  foreach my $site (@nu) { 
+            $minor = $genos2{$site} if ($site ne 'N' && $site ne '-');  #############
+            push @minor, $genos3{$site}[0], $genos3{$site}[1] if ($site ne 'N' && $site ne '-'); ######PHYLO           
+	    print GENO $genos2{$site}, "\t";  
+	    print SNP $genos{$site}, "\t";
+	    $min_het ++ if ($genos{$site}) eq '1';
+	  }
+	  print SNP "\n";
+	  print GENO "\n";
+
+
+	 if ($minor) {#############
+	    my @unique = uniq (@minor); ################
+	    foreach (@unique) {################
+	      print SNPID $_,"\t"; #############
+	    }###############
+	    print SNPID "\n";###########
+	  } #############
+	  if (!$minor) {#############
+	    print SNPID "N\tN\n" if (!@array);#############
+	  }#############
+	} ## else
+      
+      my $non_dialleic = $resdir .  "locus" . $locus . "_Non_diallelic_SNPID.txt"; ##################
+      open (ININ, "<", $SNP_ID);###########
+      open (NONSNP, ">", $non_dialleic) ; ################
+      while (<ININ>) {#############
+	chomp (my $l = $_);#############
+	my @line = split /\s+/,$l;###########
+	print NONSNP $l, "\n" if (scalar (@line) > 3);#############
+      }#############
+      close ININ;###########
+      close NONSNP;############
+      unlink ( $non_dialleic) if (-z $non_dialleic);
+      
+
+         
+	if ($min_het/$site > $het) {
+	  delete ($final{$locus});
+	  system ("mv $file $hetDir");
+	  unlink ($indSNPs, $indGeno, $non_dialleic, $SNP_ID); #####################
+	  $fhet{$locus}++;
+	  last;
+	}
+	
+      } ## while (<TRANS>)
+      close SNP;
+      close GENO;      	
+    } ## if ($final{$locus}) {
+
+  }##foreach @aln
+        
+  my $perhet = $het * 100;
+  print "\n", scalar keys %fhet, " loci having at least one site where ", $perhet, "% of the samples are heterozygous !!\n";  
+  print "\n", "All the above loci failed to pass various filters are moved to subfolders and will not be used for the downstrean analyses!\n\n\n";
+  
+
+  my $non_di =  $resdir . "Individual_Non_diallelic/";
+  mkdir $non_di unless -e $non_di;
+
+  my $fake = $resdir . "empty_Non_diallelic_SNPID.txt";
+
+  open (FAKE, ">", $fake);
+  print FAKE "test", "\t", "1","\n";
+  
+  close FAKE;
+  
+  system ("mv $resdir*Non_diallelic_SNPID.txt $non_di") ;
+  system ("cp $resdir*sampleID.txt $non_di");
+  
+  my $snpid = $resdir . "Individual_SNPID/";
+  mkdir $snpid unless -e $snpid;
+  system ("mv  $resdir*SNPID.txt $snpid ");
+  system ("cp $resdir*sampleID.txt $snpid");
+    
+  my $snps = $resdir . "Individual_SNPs/";
+  mkdir $snps unless -e $snps;
+  system ("mv  $resdir*_SNP $snps ");
+  system ("cp $resdir*sampleID.txt $snps");
+  
+  my $geno =  $resdir . "Individual_GENOs/";
+  mkdir $geno unless -e $geno;
+  system ("mv  $resdir*_geno $geno");
+  system ("cp $resdir*sampleID.txt $geno");
+  
+  my $alns = $resdir . "Individual_ALNs/";
+  mkdir $alns unless -e $alns;
+  system ("mv  $resdir*.aln $alns");
+  system ("cp $resdir*sampleID.txt $alns");
+}
+
+
+sub transpose {
+    my ($file, $size, $site1, $out) = @_;
+    
+    open (OUT1, '>', $out);  
+    for (my $i = 1; $i <= $size; $i++) {
+      my $count = $site1;
+      open (IN1, '<', $file);
+      foreach (<IN1>) {
+	chomp();	  
+	if ($count > 1) {
+	  my @line = split /\s+/, $_;
+	  print OUT1 $line[$i-1], "\t";
+	  $count--;
+	}
+	elsif ($count == 1) {
+	  my @line = split /\s+/, $_;
+	  print OUT1 $line[$i-1], "\n";
+	}
+	else {
+	  last;
+	}
+      }
+    }
+    close IN1;
+    close OUT1;
+   # unlink ($file);
+  }
+  
+
+#########################################################################
+#########################################################################
+#########################################################################
+#########################################################################
+#########################################################################
+
+
+
+sub contig {
+  die(qq/
+
+RADTools contig [options] 
+
+Options for paired-end reads:
+
+-E     INT     1 = population genetic dataset (mapping based)
+               2 = phylogenetic dataset (alignment based) [1]
+-a     DIR     A folder with all cleaned reads (AAA_1_final.fastq, 
+               AAA_2_final.fastq)
+-i     INT     insert size of the libraries
+-b     INT     read length
+-f     INT     Length of each forward read of PE after trimming off RERS 
+-r     INT     Length of each reverse read of PE after trimming off RERS
+-R     CHAR    Species used for repeatmasking. some examples are: human, mouse, rattus, 
+               "ciona savignyi",arabidopsis, mammal, carnivore, rodentia, rat, cow, pig,
+               cat, dog, chicken, fugu, danio, "ciona intestinalis", drosophila, 
+               anopheles, elegans,diatoaea, artiodactyl, rice, wheat, maize, 
+               "vertebrata metazoa" 
+-T     CHAR    Use a custom-build repetitive library (full path) for repeat masking, 
+               in this case do not use -R
+-t     INT     Number of threads used in clustering [10]
+-m     INT     memory limit (in MB) for the program, default 800; 0 for unlimitted [0]
+-c     FLOAT   Sequence identity threshold for clustering reads in cdhit [0.96]
+-l     INT     Length of throw_away_RAD_locus in cdhit [40] 
+-M     FLOAT   Discard a locus if M percent bases are Ns [0.6]
+-I     CHAR    Instrument ID (e.g. HS, MS or HWI) [HS]
+-p             Paired-end data? if no then do not use -p [p]
+-S             if paired-end, assemble the R2 reads? Only make sense for PE sdRAD
+               [null] 
+
+Only use the following additional options when E = 2 
+
+-G     JAR     GATK.jar (full path)
+-P     JAR     Picard.jar (full path)
+-d     INT     Minimum depth to keep a site, otherwise masked as an "N" [8]
+-D     INT     Maximum depth to keep a site, otherwise masked as an "N" [100000]
+-N     INT     INDEL filtering window [5]
+-s     INT     Number of threads for bowtie2 alignment [4]
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Options for single-end reads:
+
+-a     DIR     A folder with all cleaned reads (AAA_1_final.fastq, BBB_1_final.fastq)
+-E     INT     1 = population genetic dataset (mapping based)
+               2 = phylogenetic dataset (alignment based) [1]
+-f     INT     Length of each forward read after trimming off RERS 
+-R     CHAR    Species used for repeatmasking. some examples are: human, mouse, rattus, 
+               "ciona savignyi",arabidopsis, mammal, carnivore, rodentia, rat, cow, pig,
+               cat, dog, chicken, fugu, danio, "ciona intestinalis", drosophila, 
+               anopheles, elegans,diatoaea, artiodactyl, rice, wheat, maize, 
+               "vertebrata metazoa" 
+-T     CHAR    Use a custom-build repetitive library (full path) for repeat masking, 
+               in this case do not use -R
+-t     INT     Number of threads used in clustering [10]
+-m     INT     memory limit (in MB) for the program, default 800; 0 for unlimitted [0]
+-c     FLOAT   Sequence identity threshold for clustering unpaired reads in cdhit [0.96]
+-l     INT     Length of throw_away_RAD_locus in cdhit [40]     
+-M     FLOAT   Discard a locus if M percent bases are Ns [0.6]
+-p             Paired-end data? if no then do not use -p [p]
+
+Only use the following additional options when E = 2 
+
+-G     JAR     GATK.jar (full path)
+-P     JAR     Picard.jar (full path)
+-d     INT     Minimum depth to keep a site, otherwise masked as an "N" [8]
+-D     INT     Maximum depth to keep a site, otherwise masked as an "N" [100000]
+-N     INT     INDEL filtering window [5]
+-s     INT     Number of threads for bowtie2 alignment [4]
+
+
+FLASH, cd-hit in path!
+
+
+\n\n/) unless (@ARGV);
+  
+  
+  my %opts = (a=>undef, 1=>undef, 2=>undef,l=>40, i=>undef, c=>0.96, m=>0,  d=>8,D=>100000, N=>5,s=>4, f=>undef,r=>undef,M=>0.6,R=>undef, T=>undef, G=>undef, P=>undef, E=>1, t=>10, b=>undef, I=> "HS" );
+  getopts('i:b:a:1:2:c:m:l:f:r:d:D:N:s:M:R:T:P:G:E:t:I:pS', \%opts);
+  
+  
+  my $dir;
+  
+  if ($opts{a} =~ m/\/$/ ){
+    $dir = $opts{a}; 
+  }
+  else {
+    $dir = $opts{a} . "/";
+  }
+  my $threads = $opts{t};
+  my $th = $opts{c};
+  my $mem = $opts{m};
+  my $l = $opts{l};
+  my $fl = $opts{f};
+  my $rl = $opts{r} if $opts{p} ;
+  my $vcf2fqMinDepth = $opts{d} if  $opts{d};
+  my $vcf2fqMaxDepth = $opts{D} if  $opts{D};
+  my $vcf2fqIndelFilter =  $opts{N} if  $opts{N};
+  my $thread = $opts{s} if  $opts{s};
+  my $ma = $opts{M};
+  my $type = $opts{E};
+  my $length =  $opts{b} if $opts{b} ;
+  my $insert = $opts{i} if $opts{i} ;
+  my $InID = $opts{I} if $opts{I} ;
+
+
+  
+  my $rep;
+  my $c;
+  
+  if ($opts{R}) {
+    $rep = $opts{R};
+    $c =1;
+    my @rep = split /\s+/, $rep;
+    if (scalar (@rep) > 1) {
+      $rep = '"' . $rep . '"'; 
+    }
+  }
+  if ($opts{T}) {
+    $rep = $opts{T};
+    $c = 2;
+  }
+  die "Warning! You can only use -R or -T !\n" if ($opts{R} && $opts{T});
+  
+  
+  
+  my $resdir = $dir . "individual_contigs/";
+  mkdir  $resdir unless -e $resdir;
+  
+  my $indfilter = $resdir . "individual_contigs_stats/";
+  mkdir $indfilter unless -e $indfilter;
+  
+
+  my @lib = <$dir*_1_final.fastq> or die "Warning! No Input Libraries!\n";
+  foreach my $read1 (@lib) {
+    my $lib = $1 if basename($read1) =~ m/(\S+)_1_final/;
+    if ($opts{p}) {
+      my $read2 = $read1; $read2 =~ s/_1_final/_2_final/;
+      my $readu = $read1; $readu =~ s/_1_final/_Unpaired_final/;
+
+      my ($template, $newdir) = Callcdhit ($read1, $read2, $readu, $lib,  $resdir, $fl, $rl, $mem, $l, $th, $threads, $insert, $length, $InID);
+
+      
+      my $newread1 = $newdir . basename ($read1);
+      my $newread2 = $newdir . basename ($read2);
+      my $newreadu = $newdir . basename ($readu);
+      
+      if ($type == 1) {
+	BuildContig ($lib, $resdir, $template, $newread1, $newread2, $newreadu, '1', '1', '1', '1', $indfilter,$ma, $rep, $c, '1', '1', 'pe', $type);
+      }
+      if ($type == 2) {       
+	BuildContig ($lib, $resdir, $template, $newread1, $newread2, $newreadu, $vcf2fqMinDepth, $vcf2fqMaxDepth, $vcf2fqIndelFilter, $thread, $indfilter,$ma, $rep, $c, $opts{G}, $opts{P}, 'pe', $type);
+      }
+      
+	
+    }
+    
+    if (!$opts{p}) {
+      my $template = SEcdhit ($read1, $dir, $lib, $th, $mem, $l,$resdir,$threads);
+      if ($type == 2) {	
+	BuildContig ($lib, $resdir, $template,$read1, $read1, $read1, $vcf2fqMinDepth, $vcf2fqMaxDepth, $vcf2fqIndelFilter, $thread, $indfilter,$ma, $rep, $c, $opts{G},$opts{P}, 'se', $type);
+      }
+      if ($type == 1) {
+	BuildContig ($lib, $resdir, $template, $read1, $read1, $read1, '1', '1', '1', '1', $indfilter,$ma, $rep, $c, '1','1', 'se', $type);
+      }
+      
+    }
+    print "\nProgram finished successfully!\n";
+    
+  }
+}
+
+
+
+
+
+sub BuildContig {
+  my ($name, $resdir, $template,$read1, $read2, $readu, $d, $D, $L, $p, $dir, $ma,$rep,$c, $GATK,$Picard, $suf, $type) = @_;
+  
+  
+  my $template_fix = $template . "_final";
+  open (TEM, "<",$template);
+  open (TEMFINAL,">", $template_fix);
+  
+  my %temf;
+  while (<TEM>) {
+    chomp (my $line = $_);
+    if ($line =~ m/^>(\S+)/) {
+      chomp (my $seq = <TEM>);
+      my $d = $1;
+      $temf{$d}{'seq'} = $seq;
+      my $length = length ($seq);
+      my $seq2 = $seq;
+      my $Ncount;
+      $Ncount = ($seq2 =~ s/N//g);
+      $temf{$d}{'N'} = $Ncount;	
+      $temf{$d}{'len'} = $length;
+      $temf{$d}{'ef'} =  $length - $Ncount;
+      if ($Ncount) {
+	$temf{$d}{'Nratio'} = $Ncount/$length;	
+      }
+      else {
+	$temf{$d}{'Nratio'} = 0;
+      }     
+    }    
+  }
+  close TEM;
+  
+  foreach my $id (sort {$a cmp $b} keys %temf) {
+    if ($temf{$id}{'Nratio'} <= 0.9) {
+      print TEMFINAL ">", $id, "\n";    
+      print TEMFINAL $temf{$id}{'seq'}, "\n";
+    }
+  }
+  close TEMFINAL;
+  
+  system ("mv $template_fix $template");
+
+  my $indexref = $template . ".nix" if $type == 2;
+  system ("novoindex $indexref $template") if $type == 2;
+  
+  my $sorted_in_target_bams = $resdir . $name . "_sorted" if $type == 2;
+  my $sorted = $sorted_in_target_bams. ".bam" if  $type == 2;
+  
+  if ($type == 2) { 
+    if ($suf eq 'pe') {  
+      my $readCombined = $resdir . $name . "_u_final.fastq";
+      
+      system("novoalign -R 30 -t 150  -d $indexref -f $read1  $read2  -i PE 500, 50 -F STDFQ -o SAM > outPairedSam1");
+      system("novoalign -R 30 -t 150  -d $indexref -f $readu  -F STDFQ -n 250 -o SAM -s 2 > outSoloSam1");
+      
+      
+      system("grep -v ZS:Z:NM outPairedSam1 | grep -v NH:i: > paired_in_target.sam");
+      system("grep -v ZS:Z:NM outSoloSam1 | grep -v NH:i:  > solo_in_target.sam");
+      
+      system("samtools view -bhS paired_in_target.sam >  paired_in_target.bam");
+      system("samtools view -bhS solo_in_target.sam > solo_in_target.bam");
+      
+      
+      system("samtools merge raw.bam paired_in_target.bam solo_in_target.bam");
+      
+      system("samtools sort raw.bam $sorted_in_target_bams");
+      
+      system("samtools index $sorted");  
+      
+      system("rm outPairedSam1 outSoloSam1 paired_in_target.sam solo_in_target.sam paired_in_target.bam solo_in_target.bam raw.bam"); 
+      
+      unlink ( $readCombined);
+    }
+    if ($suf eq 'se') {
+      system("novoalign -R 30 -t 150  -d $indexref -f  $read1  -F STDFQ -n 250 -o SAM -s 2 > outSoloSam1");
+      
+      system("grep -v ZS:Z:NM outSoloSam1 | grep -v NH:i: > solo_in_target.sam");
+      
+      
+      system("samtools view -bhS solo_in_target.sam > solo_in_target.bam");
+      
+      
+      system("samtools sort solo_in_target.bam $sorted_in_target_bams");
+      
+      system("samtools index $sorted");  
+      
+      system("rm outSoloSam1 solo_in_target.sam  solo_in_target.bam"); 
+      
+    }
+  
+  
+  
+  system ("samtools faidx $template");
+  
+  my $refname = $1 if basename ($template) =~ m/(\S+)\.fasta/;
+  my $index_ref = $resdir. $refname . '.dict'; 
+  system ("java -jar $Picard CreateSequenceDictionary R=$template O=$index_ref");  
+  
+  my $addgroupbam = $resdir . $name . ".rg.bam"; 
+  system("java -Xmx2g -jar $Picard AddOrReplaceReadGroups INPUT=$sorted OUTPUT=$addgroupbam RGID=$name RGLB=RAD RGPL=illumina RGPU=lane1 RGSM=$name");
+  my $addgroupbamsort = $resdir . $name . "_sorted";
+  my $addgroupbamsorted = $addgroupbamsort . ".bam";
+  system("samtools sort $addgroupbam $addgroupbamsort");
+  system("samtools index $addgroupbamsorted");    
+  
+  my $intervals = $resdir . $name .".intervals";
+  system ("java -Xmx2g -jar $GATK -T RealignerTargetCreator -R $template -I $addgroupbamsorted -o $intervals");
+  my $final = $resdir . $name . ".bam";
+  my $final_sort = $resdir . $name . "_sorted";
+  system ("java -Xmx2g -jar $GATK -I $addgroupbamsorted -R $template -T IndelRealigner -targetIntervals $intervals -o $final");
+  unlink ($sorted, $addgroupbam, $addgroupbamsorted, $intervals);
+  
+  system ("samtools sort $final $final_sort");
+  $sorted = $resdir . $name . "_sorted.bam";
+  
+  system ("rm $resdir$name*.bai $final $index_ref") ;
+  system ("samtools index $sorted");
+  
+ 
+  
+  my $fq = $resdir . $name .'.fq';
+  print "\n\nNow reconstructing each of the RAD loci!\n\n";
+  
+  system ("samtools mpileup -A -Q 20 -ugEf $template $sorted | bcftools call -c - | vcfutils.pl vcf2fq -d $d -D $D -l $L >  $fq"); 
+  my @vcf = `samtools mpileup -t DP  -I -ugEf $template $sorted | bcftools call -c -`;
+
+  my @loci_to_filter;
+  foreach (@vcf) {
+    chomp (my $line = $_);
+    next if $line =~ /^#/;
+    my $depth = $1 if  $line =~ /DP=(\d+)/;
+    chomp (my @t = split /\s+/, $_);
+    if ($t[3] ne 'N'){
+      if ($t[4] =~ m/,/ && $depth >= $d) {
+	push @loci_to_filter, $t[0];
+      }    
+    }
+  }
+  ## note: number of sites in "loci_depth.txt" and ".unfiltered.fasta" is different because there are some loci do not have data so they don't show in "loci_depth.txt";
+  
+  my $fa = $dir . $name . '.fasta';
+  
+  my $fa_all_fix = $dir . $name . '_fixLength_all.fasta';
+  system ("seqtk seq -q 20 -A $fq -n N > $fa");
+
+  open (IN, "<", $fa);
+  open (OUT, ">", $fa_all_fix);
+  
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ m/^>(\S+)/) {
+      my $d = $1;
+      chomp (my $seq = <IN>);
+      my $ns = 'N' x ($temf{$d}{'len'} - length ($seq) );
+      my $newseq = $seq . $ns;
+      print OUT ">", $d , "\n";
+      print OUT $newseq, "\n"; 
+    }
+  }
+  close IN;
+  close OUT;
+  system ("mv $fa_all_fix $fa");
+
+
+  my $fa2 = $dir . $name . '_filtered.fasta';
+  my $h =  $dir . $name . '_individual_H.txt';
+  open (IN, "<", $fa);
+  open (OUT, ">", $fa2);
+  open (OUT2, ">", $h);
+
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ /^>(\S+)/) {
+      my $id = $1;
+      chomp (my $seq = <IN>);
+      $seq =~ s/[a|c|g|t|n|y|s|k|r|w|m]/N/g ;
+      my $length = length ($seq);
+      my $seq1 = $seq;
+      my $H = ($seq1 =~ s/[Y|S|K|R|W|M]//g);
+      print OUT $line, "\n", $seq, "\n";
+      print OUT2 $line, "\t",  sprintf("%.3f",$H/$temf{$id}{'ef'}), "\n";    
+    }
+  }
+  close IN;
+  close OUT;
+  close OUT2;
+  unlink ($fa);
+  
+  
+  system ("RepeatMasker -q -no_is -species $rep $fa2") if ($c == 1);
+  system ("RepeatMasker -q -no_is -lib $rep $fa2") if ($c == 2);
+ 
+  my $infile = $fa2. ".masked";
+  
+  my %filter_masked;
+  unless (-z $infile) {
+    open (IN, "<", $infile);
+    my $id;   
+    while (<IN>) {
+      chomp (my $line = $_);
+      if ($line =~ /^>(\S+)/) {
+	$id = $1;
+      }
+      else {
+	$filter_masked{$id} .= $line;    
+      }
+    }
+    close IN;
+  }
+  else {
+    open (IN, "<",$fa2);
+    my $id;   
+    while (<IN>) {
+      chomp (my $line = $_);
+      if ($line =~ /^>(\S+)/) {
+	$id = $1;
+      }
+      else {
+	$filter_masked{$id} .= $line;    
+      }
+    }
+    close IN;
+  }
+  
+  
+  my $fa_repeatmasked = $dir . $name . '_repeatMasked.fasta';
+  open (OUT, ">", $fa_repeatmasked);
+  
+  foreach my $id (sort {$a cmp $b} keys %filter_masked) {
+    my $seq = $filter_masked{$id};
+    my $length = length ($seq);
+    my $seq1 = $seq;
+    my $N = ($seq1 =~ s/N//ig) - $temf{$id}{'N'};
+    unless ($N/$temf{$id}{'ef'} >= $ma){
+      unless (grep {$_ eq $id} @loci_to_filter) {
+	print OUT ">", $id, "\n", $seq, "\n";
+      }
+    }
+  }
+  close OUT;
+  
+  system (" rm $fa2.* ");
+  system ("mv $fa_repeatmasked $fa2");
+
+  #####now calculate coverage#####
+  my $file ='depth';
+  my $per_gene_depth =  $dir . $name . "_RAD_loci_depth.txt";
+
+  system ("samtools depth $sorted > $file");
+  
+  tie my @gene, 'Tie::Array::Packed::Number';
+   
+  open (IN, "<", $file);
+ 
+  my %gene;
+  while (<IN>) {
+    chomp (my @l =split /\s+/, $_);
+    $gene{$l[0]}{'dep'} += $l[2];
+    $gene{$l[0]}{'count'} ++;
+  }
+  close IN;
+  unlink ($file);
+
+  open (OUT1, ">", $per_gene_depth);
+  
+  foreach my $g (sort { $a cmp $b} keys %gene) {
+    print OUT1 $g, "\t",  $gene{$g}{'dep'}/$gene{$g}{'count'},"\n";
+  }
+  close OUT1;
+
+  
+} #if $type == 2
+
+
+  if ($type == 1) { 
+  #system ("RepeatMasker -q -no_is -species $rep $template") if ($c == 1);
+  #system ("RepeatMasker -q -no_is -lib $rep $template") if ($c == 2);
+	  
+  #my $infile2 = $template. ".masked";
+  
+  #open (IN, "<", $infile2);
+  #my $id2;
+  #my %filter_masked2;
+  #while (<IN>) {
+  #  chomp (my $line = $_);
+  #  if ($line =~ /^>(\S+)/) {
+  #    $id2 = $1;
+  #  }
+  #  else {
+  #    $filter_masked2{$id2} .= $line;
+      
+  #  }
+  #}
+  #close IN;
+  
+  #my $final_repeatmasked = $dir . $name . '_repeatMasked_unfiltered_final.fasta';
+  #open (OUT, ">", $final_repeatmasked);
+  
+  #foreach my $id (sort {$a cmp $b} keys %filter_masked2) {
+  #  my $seq = $filter_masked2{$id};
+  #  my $length = length ($seq);
+  #  my $seq1 = $seq;
+  #  my $N = ($seq1 =~ s/N//ig) - $temf{$id}{'N'};
+  #  unless ($N/$temf{$id}{'ef'}  >= $ma){
+      
+  #	print OUT ">", $id, "\n", $seq, "\n";
+      
+  #  }
+  #}
+  #close OUT;
+
+  #system ("rm $template.* $template ");
+    #system ("mv $final_repeatmasked $template");
+    system ("rm $template.* ");
+} # if $tyep == 1
+
+  
+  #system ("rm  $resdir*.fai  $resdir*sorted.bam* "); 
+}
+
+
+
+###pick the most frequent RAD locus from each rainbow cluster as a reference to reconstrcut contig. Frequency must be longer than 1 for ddRAD.
+
+sub most_Frequent {
+  my ($array) = @_; 
+  my @array = @{$array};
+  
+  my(%count);
+  foreach my $value (@array) {
+    $count{$value}++;
+  }
+  my $max_value = (sort {$count{$b} <=>  $count{$a}} @array)[0];
+  my $counts = $count{$max_value};
+
+  if ($counts ==1 ) {
+    my @array2;
+    foreach (@array) {
+      push @array2, $_;
+      
+    }
+    my $ForMax=0;
+    length ($array2[$ForMax]) >length($array2[$_]) or $ForMax = $_ for 1 .. $#array2;
+    $max_value = $array2[$ForMax];
+    
+  }
+  return ($max_value, $counts);
+  
+}
+
+
+
+sub get_rid_of_singletone {
+  my ($r2fa, $dir, $name,$mem, $l, $th, $threads) = @_;
+  #$r2fa is read1 
+  my $OUT2 =  $dir. $name . "_cdhit_multiple_hits_reverse.out";
+  system("cd-hit-est -i $r2fa -o $OUT2 -M $mem -c $th -l $l -d 100 -B 1 -n 8 -T $threads");
+  my $CLUSTER = $OUT2 . ".clstr"; 
+  open (IN, "<", $CLUSTER);
+  my %Ucluster;
+  my $id;
+  my $seq;
+  while (<IN>) {
+    chomp (my $line = $_);
+  
+    if ($line =~ m /^(>\S+\s\d+)/) {
+      $id = $1;
+      $seq = "NA";
+    }
+    else {
+      chomp (my @a = split/\s+/, $line);
+      if ($a[0] == 0 && $line =~ m/\*$/) {
+	$seq = $1 if $line =~ />(\S+\/[1|2])\.\.\./;
+	$Ucluster{$seq}++;
+      }
+      
+      if  ($a[0] >= 1) {
+	delete $Ucluster{$seq} if $Ucluster{$seq};
+      }
+    }  
+  } 
+  close IN;
+  
+  my %read22Seq;
+  open (IN2, "<", $r2fa);
+  while (<IN2>) {
+      chomp (my $line = $_);
+      my $id = $1 if ($line =~ /^>(\S+)/);
+      chomp (my $seq = <IN2>);
+      $read22Seq{$id} = $seq;
+    }
+  close IN2;
+  
+  my $fa22 =   $dir. $name . "_reverse_tmp.fa";
+  open (OUT, ">",$fa22 );
+  foreach my $id (keys %read22Seq) {
+    unless ($Ucluster{$id}) {
+      print OUT ">", $id, "\n";
+      print OUT $read22Seq{$id}, "\n";
+    }
+  }
+  close OUT;
+  system ("rm $CLUSTER $OUT2");
+  system ("mv $fa22 $r2fa");
+  return ($r2fa, \%Ucluster);
+}
+
+
+sub cdhit2 {
+  my ($r1fa, $r2fa, $suf, $name,$dir,$mem, $l, $th, $threads) = @_;
+  
+  my %discard;
+  my %pair;
+ 
+  my $out1 = $dir. $name . "_cdhit_multiple_hits.out";
+  system("cd-hit-est -i $r1fa -o $out1 -M $mem -c $th -l $l -d 100 -B 1 -n 8 -T $threads");
+ 
+  my $cluster = $out1 . ".clstr";
+  
+  open (IN, "<", $cluster);
+  my %Ucluster;
+  my $id1;
+  my $seq1;
+  while (<IN>) {
+    chomp (my $line = $_);
+    
+    if ($line =~ m /^(>\S+\s\d+)/) {
+      $id1 = $1;
+      $seq1 = "NA";
+    }
+    else {
+      chomp (my @a = split/\s+/, $line);
+      if ($a[0] == 0 && $line =~ m/\*$/) {
+	$seq1 = $1 if $line =~ />(\S+\/[1|2])\.\.\./;
+	$Ucluster{$seq1}++;
+      }
+      
+      if  ($a[0] >= 1) {
+	delete $Ucluster{$seq1} if $Ucluster{$seq1};
+      }
+    }  
+  } 
+  seek IN, 0, 0;
+  
+
+
+  my $id;
+  my $seq;
+  my %read2;
+  my %nonsingle;
+  my $ID;
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ m /^>\S+\s(\d+)/) {
+      $id = $1;
+      $ID = 'yes';
+      $seq = "NA";
+    }
+    else {
+      if ($line =~ /\*$/) {
+	if ($line =~ />(\S+\/)([1|2])\.\.\./ ) {
+	  $seq = $1 . $suf;
+	  $ID = $1. $2;
+	  push @{$read2{$id}},  $seq unless $Ucluster{$ID};
+	}
+      }
+      if ($line !~ /\*$/) {	
+	if ($line =~ />(\S+\/)[1|2]\.\.\./) {
+	  $seq = $1 . $suf;
+	  push @{$read2{$id}},  $seq;
+	}
+      }
+    }
+    
+    $nonsingle{$id} = $ID;
+    
+  }    
+  close IN;
+  
+  my %read1Seq;
+  open (IN1, "<", $r1fa);
+  while (<IN1>) {
+    chomp (my $line = $_);
+    my $id = $1 if ($line =~ /^>(\S+)/);
+    chomp (my $seq = <IN1>);
+    $read1Seq{$id} = $seq;
+  }
+  close IN1;
+  
+  my %read2Seq;
+  open (IN2, "<", $r2fa);
+  while (<IN2>) {
+    chomp (my $line = $_);
+    my $id = $1 if ($line =~ /^>(\S+)/);
+    chomp (my $seq = <IN2>);
+    $read2Seq{$id} = $seq;
+  }
+  close IN2;
+  
+  foreach my $id (sort {$a <=> $b} keys %read2 ) {
+    my $read2in = $dir. $name . "_" . $id . "_cdhit_multiple_hits_check.in";
+    open (OUT, ">", $read2in);
+    my $forward_count = scalar (@{$read2{$id}});
+    for (my $i = 0 ; $i < scalar (@{$read2{$id}}); $i++) {
+      print OUT ">", $read2{$id}[$i],"\n" if $read2Seq{$read2{$id}[$i]};
+      print OUT $read2Seq{$read2{$id}[$i]}, "\n" if $read2Seq{$read2{$id}[$i]};
+    }
+    close OUT;
+
+    if (-z $read2in) { #nothing here, all singletons. already in %discard 
+      #print $read2in, "\n";
+      if ($suf == 2) {	###all reverse reads are singletons and the top sequence in forward is saved as a final marker. 
+	$pair{$id}{'1'} = $nonsingle{$id};
+	$pair{$id}{'2'} = $nonsingle{$id};
+	$pair{$id}{'fseq'} =  $read1Seq{$nonsingle{$id}};
+	$pair{$id}{'rseq'} =  $read1Seq{$nonsingle{$id}};
+      }
+      system ("rm $read2in");
+    }
+    else {
+      my $read2out = $dir. $name . "_" . $id . "_cdhit_multiple_hits_check.out";
+      my $th2 = $th - 0.03;
+      my $call1 = system("cd-hit-est -i $read2in -o $read2out  -M $mem -c $th2 -l $l -d 100 -T threads  -B 1 -n 8 ");
+      #system ("rm logfile1");
+      my $read2cluster = $read2out . ".clstr";
+      
+      my $left = 0;
+      my %seqq;
+      open (IN, "<", $read2in);
+      while (<IN>) {
+	chomp (my $line = $_);
+	$left ++ if $line =~ /^>/;
+	$seqq{$1} ++ if $line =~ /^>(\S+)/;
+      }
+      close IN;
+    
+    
+      open (CD, "<", $read2out);
+      my $cc = 0;   
+      while (<CD>) {
+	chomp (my $line = $_);
+	$cc++ if ($line =~ /^>(\S+)/);
+      }
+      close CD;
+      
+      
+      if ($suf == 2) {
+	if ($cc == 1 && $left >= $forward_count - 1 && $left > 1 ) { ## at least two sequences, and only one missing sequence is allowed
+	  for (my $i = 0 ; $i < scalar (@{$read2{$id}}); $i++) {
+	    my $zd = $1 if $read2{$id}[$i] =~ /(\S+\/[1|2])/;
+	    $discard{$zd}++ unless ($seqq{$read2{$id}[$i]} ); 	    
+	  }
+	  open (IN, "<", $read2cluster);	
+	  while (<IN>) {
+	    chomp (my $line = $_);
+	    if ($line !~ /^>\S+/ ) {
+	      chomp (my @a = split/\s+/, $line);	  
+	      if ($a[3] eq '*') {
+		my $read2id = $1 if $line =~ />(\S+\/2)\.\.\./ ;
+		$pair{$id}{'1'} = $nonsingle{$id};
+		$pair{$id}{'2'} = $read2id;
+		$pair{$id}{'fseq'} =  $read1Seq{$nonsingle{$id}};
+		$pair{$id}{'rseq'} =  $read2Seq{$read2id};	    
+	      }	  
+	    }	
+	  }
+	  close IN;      
+	} ##if ($cc == 1 && $left == $forward_count)
+	
+	else  {
+	  for (my $i = 0 ; $i < scalar (@{$read2{$id}}); $i++) {
+	    my $zd = $1 if $read2{$id}[$i] =~ /(\S+\/[1|2])/;
+	    $discard{$zd}++;
+	  }
+	  $pair{$id}{'1'} = $nonsingle{$id};
+	  $pair{$id}{'2'} = $nonsingle{$id};
+	  $pair{$id}{'fseq'} =  $read1Seq{$nonsingle{$id}};
+	  $pair{$id}{'rseq'} =  $read1Seq{$nonsingle{$id}};
+	} ## else
+	
+      } ##if ($suf == 2)
+    
+    
+    system ("rm $read2in $read2out $read2cluster");  
+    }
+  } ## foreach my $id (sort {$a cmp $b} keys %read2 ) {
+  
+  system ("rm  $out1 $cluster");
+  return (\%discard) if ($suf == 1);
+  return (\%discard, \%pair, \%Ucluster) if ($suf == 2);
+  
+}
+
+
+
+### call rainbow to cluster PE reads ###
+sub Callcdhit {
+  my  ($r1, $r2, $ru, $name,  $dir, $fl, $rl,$mem, $l, $th, $threads, $insert, $length, $InID) = @_;
+  #Callcdhit ($read1, $read2, $lib,  $resdir, $fl, $rl, $mem, $l, $th);
+
+  print "\nNow using cdhit to cluster reads!\n";
+
+  
+  my $r1fa = $r1 . ".fa";
+  #my $discard1; 
+  system ("seqtk seq -A $r1 > $r1fa");
+  #($r1fa, $discard1)= get_rid_of_singletone($r1fa,$dir, $name,$mem, $l, $th, $threads);  
+   
+  my $r2fa = $r2 . ".fa";
+  #my $discard2;
+  system ("seqtk seq -A $r2 > $r2fa");
+  #($r2fa, $discard2)= get_rid_of_singletone($r2fa, $dir, $name,$mem, $l, $th, $threads);  
+
+  
+  my ($hash1, $pair, $discard1) = cdhit2 ($r1fa,$r2fa,'2',$name,$dir,$mem, $l, $th, $threads);
+ # my $hash2 = cdhit2 ($r2fa,$r1fa,'1',$name,$dir,$mem, $l, $th, $threads);
+
+  
+
+  system ("rm $r1fa $r2fa");
+  
+  my %disfinal = (%{$hash1}, %{$discard1});
+  my %pair = %{$pair};
+
+  my $newdir = $dir . "merged_clean/";
+  mkdir $newdir unless -e $newdir;
+  
+  my $temname = $newdir.  $name . "_merge";
+  my $call1 = system("flash  $r1  $r2 -M $rl  -x 0.1  --allow-outies -o $temname");
+  die(qq/\nThe program "flash" is not in path! \n\n/) if ($call1 == -1 );
+  
+  open (EXTEND,"<",  $temname . ".extendedFrags.fastq");
+  open (NEW, ">",  $temname . ".extendedFrags.fastq1");
+  while (<EXTEND>) {
+    chomp(my $line = $_);	
+    if ($line =~ m/^@($InID\S+)/) {
+      my $new_line =  $line . "/1";
+      my $seq =<EXTEND>;
+      my $qualid = <EXTEND>;
+      my $qual = <EXTEND>;
+      print NEW $new_line , "\n" , $seq , $qualid , $qual;
+    } 
+  }
+  close EXTEND;
+  close NEW;
+
+
+  my $newru = $newdir . basename ($ru);
+  my $newr1 = $newdir . basename ($r1);
+  my $newr2 = $newdir . basename ($r2);
+  
+  my $call2 = system("cat $temname\.extendedFrags.fastq1  $ru > $newru");
+  my $call4 = system("mv $temname\.notCombined_1.fastq   $newr1");
+  my $call5 = system("mv $temname\.notCombined_2.fastq   $newr2");
+  my $call6 = system("rm $temname\.extendedFrags.fastq $temname\.extendedFrags.fastq1 $temname\.hist*");
+
+  my %R1;
+  open (R1,"<", $r1);
+  while (<R1>) {
+    chomp (my $line = $_);
+    if ($line =~ m/^@($InID\S+)/) {
+      my $id = $1;
+      my $seq =<R1>;
+      my $qualid = <R1>;
+      my $qual = <R1>; 
+    
+      $R1{$id} = $qual;
+    }
+  }
+  close R1;
+
+  my %R2;
+  open (R2,"<", $r2);
+  while (<R2>) {
+    chomp (my $line = $_);
+    if ($line =~ m/^@($InID\S+)/) {
+      my $id = $1;
+      my $seq =<R2>;
+      my $qualid = <R2>;
+      my $qual = <R2>; 
+    
+      $R2{$id} = $qual;
+    }
+  }
+  close R2;
+  
+  
+  
+  my $outfinal = $dir. $name . ".first_path";
+  my $ddd = 0; 
+  open (OUT, ">", $outfinal);
+  foreach my $id (sort {$a <=> $b} keys %pair) {
+    $ddd++;
+    if ($pair{$id}{'1'} eq $pair{$id}{'2'} && $pair{$id}{'fseq'} eq $pair{$id}{'rseq'}) {
+      print OUT  ">", $name, "_locus", $ddd,  "\n";
+      print OUT   $pair{$id}{'fseq'}, "\n";
+    }
+    else {
+      my $forward = $dir.  $name . $id . "_forward.fastq";
+      my $reverse = $dir.  $name . $id . "_reverse.fastq";
+
+      open (F, ">", $forward);
+      print F   "@", $pair{$id}{'1'}, "\n";
+      print F   $pair{$id}{'fseq'}, "\n";
+      print F   "+","\n";
+      print F   $R1{$pair{$id}{'1'}};
+      close F;
+      open (R, ">", $reverse);
+      print R   "@", $pair{$id}{'2'}, "\n";
+      print R   $pair{$id}{'rseq'}, "\n";
+      print R   "+","\n";
+      print R   $R2{$pair{$id}{'2'}};
+
+      
+      close R;
+      
+      
+      
+      my $temname = $dir.  $name . $id . "_results"; 
+      my $call1 = system("flash  $forward $reverse -M $rl  -x 0.1  --allow-outies -o $temname");
+      die(qq/\nThe program "flash" is not in path! \n\n/) if ($call1 == -1 );
+
+      unlink ($forward, $reverse);
+      
+      my $u =  $temname . ".extendedFrags.fastq";
+      my $f =  $temname. ".notCombined_1.fastq";
+      my $r =  $temname. ".notCombined_2.fastq";
+      
+      if (-z $u) {
+	my $item1 =  $pair{$id}{'fseq'};
+	my $item2 =  $pair{$id}{'rseq'};	
+	$item2 = reverse($item2);
+	$item2 =~ tr/ATGC/TACG/;	
+	
+	my $Fstr = 'N' x ($fl - length ($item1)) ;
+	my $Rstr = 'N' x ($rl - length ($item2));
+	
+	
+	my $seqmege = $item1. $Fstr . 'NNNNNNNNNNNNNNNNNNNN' . $Rstr . $item2;
+	
+	print OUT ">", $name, "_locus", $ddd,  "\n";
+	print OUT $seqmege, "\n";
+	
+      }	
+    
+      
+      else {
+	open (U,"<", $u);
+	while (<U>) {
+	 
+	  chomp (my $line = $_);
+	  
+	  if ($line =~ /^@($InID\S+)/) {
+	    chomp (my $seq = <U>);
+	    print OUT ">", $name, "_locus", $ddd,  "\n";
+	    print OUT $seq, "\n";
+	  }
+	}
+	close U;
+      }
+    
+      my $call6 = system("rm $u $r $f $temname\.hist*");
+
+    }
+ 
+  } #foreach my $id (sort {$a <=> $b} keys %pair) {
+  close OUT;
+  
+  my $f_second = $dir. $name . ".unfiltered.fasta";
+  system("cd-hit-est -i $outfinal -o $f_second -c $th -l $l -d 100 -T $threads -n 8 -M $mem -r 1 -B 1"); 
+  
+
+  system ("rm $f_second*c* ");
+  unlink ($outfinal);
+  return ($f_second, $newdir);
+}
+
+
+sub SEcdhit {
+  my ($reads, $dir, $name, $threhold, $memory, $len, $resdir, $threads) = @_;
+
+ 
+  my $fa = $dir. $name . ".fa";
+  system ("seqtk seq -A $reads > $fa");
+
+  my $out = $resdir. $name . ".unfiltered.fasta";
+  my $call1 = system("cd-hit-est -i $fa -o $out -M $memory -c $threhold -l $len -d 100  -B 1 -n 8 -T $threads");
+
+  unlink ($fa);
+  
+  my $cluster = $out . ".clstr";
+  
+  open (IN, "<", $cluster);
+  my %Ucluster;
+  my $id;
+  my $seq;
+  while (<IN>) {
+    chomp (my $line = $_);
+  
+    if ($line =~ m /^(>\S+\s\d+)/) {
+      $id = $1;
+      $seq = "NA";
+    }
+    else {
+      chomp (my @a = split/\s+/, $line);
+      if ($a[0] == 0 && $line =~ m/\*$/) {
+	$seq = $1 if $line =~ />(\S+\/[1|2])\.\.\./;
+	$Ucluster{$seq}++;
+      }
+      
+      if  ($a[0] >= 1) {
+	delete $Ucluster{$seq} if $Ucluster{$seq};
+      }
+    }  
+  } 
+  close IN;
+
+  my $final_cluster =  $out . ".final" ;
+  open (OUT, ">", $final_cluster);
+  open (IN, "<", $out);
+  my $d =1;
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ />(\S+)/){
+      my $ids = $1;
+      if (!$Ucluster{$ids}) {
+        print OUT ">", $name,"_locus", $d  , "\n";    
+	chomp (my $seq = <IN>);
+	print OUT $seq , "\n";
+	$d++;
+      	 }
+      } 
+
+    }
+  close IN;    
+  close OUT; 
+
+ 
+  #my $fa1 = $final_cluster.".1";
+  #my $missing = -1; 
+  #my $samples = -1;
+  #self ($final_cluster, $fa1, $dir, $name, $samples, $missing, "1", $threads);
+  
+  system ("mv $final_cluster $out");
+  system ("rm $out*.c* ");
+  return ($out);
+}
+
+
+sub seqhash {
+  my ($file) = @_;
+  my %seq;
+  open (IN, "<", $file); 
+  my $id;
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ m /^>(\S+)/) {   
+      $id = $1;
+    }
+    else {
+      $seq{$id}{'seq'} .= $line;
+      $seq{$id}{'len'} .= length ($line);  
+    }   
+  }
+  close IN;
+  return (\%seq);
+}
+
+
+sub cdhit1 {
+  my ($readL,$readS, $threhold, $memory, $base, $len, $threads) = @_; 
+  
+  #my $combined1 = $base . ".unpaired.combined";
+  my $combined2 = $base . ".unpaired.combined.fasta";
+  my $out = $base . ".cdhit";
+  #system ("cat $readL $readS > $combined1");
+  #system ("seqtk seq -A $combined1 > $combined2");
+  #unlink ($combined1);
+  system ("seqtk seq -A $readL > $combined2");
+  
+  
+  my $call1 = system("cd-hit-est -i $combined2 -o $out -M $memory  -c $threhold -l $len -d 100  -B 1 -n 8 -T $threads"); 
+  unlink ($combined2);
+  
+  my $cluster = $out . ".clstr";
+  
+  open (IN, "<", $cluster);
+  my %Ucluster;
+  my $id;
+  my $seq;
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ m /^(>\S+\s\d+)/) {
+      $id = $1;
+    }
+    else {
+      chomp (my @a = split/\s+/, $line);
+      if ( $a[0] == 0 && $line =~ m/\*$/) {
+	$seq = $1 if $line =~ />(\S+\/[U|F|R])\.\.\./;
+	$Ucluster{$id} = $seq;
+      }
+      if  ($a[0] == 1) {
+	delete $Ucluster{$id} if $Ucluster{$id};
+      }
+      else {
+	next;
+      }
+    }  
+  } 
+  close IN;
+  
+  my $final_cluster =  $out . ".final" ;
+  open (OUT, ">", $final_cluster);
+  open (IN, "<", $out);
+  my %seqs;
+  my $ids;
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ />(\S+)/){
+      $ids = $1;
+    }
+    else {
+      $seqs{$ids} .= $line 
+    }
+  }
+  
+  foreach my $id (keys %Ucluster) {
+    delete $seqs{$Ucluster{$id}} if $seqs{$Ucluster{$id}}
+  }
+  
+  foreach my $cd (keys %seqs) {
+    print OUT ">", $cd , "\n", $seqs{$cd} ,"\n";
+  }
+  close OUT;
+  
+  unlink ($out, $cluster);
+  return ($final_cluster, \%seqs);
+  
+}
+
+
+############################################################################################################################################################
+############################################################################################################################################################
+############################################################################################################################################################
+############################################################################################################################################################
+############################################################################################################################################################
+############################################################################################################################################################
+sub cleanPE {
+  
+  die (qq/
+
+Usage: scrubReads cleanPE  [options]
+
+External dependencies: 
+"bowtie2", "fastQC", "flash",
+"trimmomatic", "skewer", "super_deduper"
+
+
+Options:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+-f     DIR      Path to the folder of raw fastq files
+-o     DIR      Path to the results folder 
+-t     PATH     Path to trimmoatic executable
+-c     FILE     Contaminant file
+-m     FLOAT    percent similarity to contaminant file to
+                consider a read to be a contaminant
+                [0.90]
+-R     INT      1=remove duplicates; 0 = keep all duplicates [1] 
+                Note: for DGE analysis using RNAseq data, keeping 
+                or removing duplicates is still on debate. 
+-k     INT      Number of threads needed for bowtie2 alignment 
+                (remove contamination), skewer(trimming adapters) 
+                and trimmomatic (trimming adapters and low qual) [4]
+-h     INT      Trimmomatic trimming length cutoff [36]
+-q     INT      Quality trimming threhold [23]
+-d     CHAR     The particular library that you like to process, 
+                if "all" is specified, all libraries in the folder
+                (-f) will be processed sequenctially [all]
+-g     FLOAT    Maximum allowed ratio between the number of 
+                mismatched base pairs and the overlap length [0.01]
+-l     INT      Read length [100]
+-n     FLOAT    Will get rid of reads for which more than 
+                n*100\% of bases are NNs [0.6]
+-r     FLOAT    Will get rid of reads with any runs of bases 
+                longer than r*read_length [0.5]
+-z              If z is supplied, use fastQC to evaluate 
+                cleaned sequence reads [null]
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+\n/) if !@ARGV;
+  
+  my %opts = (f=>undef, o=>undef,  t=>undef, c=>undef,  l=>100, n=>0.6, r=>0.5, g=>0.01, d=>"all", h=>36, m=>20, R=>1,w=>1,  k=>4, q=>23, M=>1, m=>0.9);  
+  getopts('f:o:t:c:l:n:r:g:m:d:i:h:R:w:k:q:z', \%opts);
+  
+  
+
+  #print out error messgaes, this looks quite 
+  die(qq/\nHmm...I do not know where you are hiding your raw sequence files... Check "-f"? \n\n/) if (!$opts{f});
+  die(qq/\nHmm...I do not know where you want to save the results... Check "-o"? \n\n/) if (!$opts{o});
+  die(qq/\nHmm...I could not find where the contaminant file is.. Check "-c"? \n\n/) if (!$opts{c});
+  die(qq/\nHmm...I could not locate where the trimmomatic executable is.. Check "-t"? \n\n/) if (!$opts{t});
+  die(qq/\nYou need to specify a library name after -d, or do not use -d to enable the defualt setting [all]. \n\n/) if (!$opts{d});
+  die(qq/\nYou need to specify a value after -g, or do not use -g to enable the defualt setting [0.05]. \n\n/) if (!$opts{g});
+  die(qq/\nYou need to specify a value after -l, or do not use -l to enable the defualt setting [100]. \n\n/) if (!$opts{l});
+  die(qq/\nYou need to specify a value after -n, or do not use -n to enable the defualt setting [0.6]. \n\n/) if (!$opts{n});
+  die(qq/\nYou need to specify a value after -r, or do not use -r to enable the defualt setting [0.5]. \n\n/) if (!$opts{r});
+  die(qq/\nYou need to specify a value after -h, or do not use -h to enable the defualt setting [36]. \n\n/) if (!$opts{h});
+
+ 
+  my $cpu = $opts{k};
+  my $rd = $opts{R};
+  my $quality = $opts{q};
+  my $InID;
+  my $index = $opts{w}; 
+  my $dir = redir ($opts{f});
+  my $outdir = redir ($opts{o});
+  mkdir ($outdir) unless -d ($outdir); 
+ 
+  my $contam = $opts{c};
+  die(qq/\nHmm...I could not find where the contaminant file is.. Check "-c"? \n\n/) unless -e $contam;
+  
+  my $uniad = 'AATGATACGGCGACCACCGAGATCTACACTCTTTCCCTACACGACGCTCTTCCGATCT';
+  
+  my $P1 = 'AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC'; ##TruSeq3_IndexedAdapter READ1
+  my $P2 = 'AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA'; ##TruSeq3_UniversalAdapter READ2
+
+  my $pe1 = 'TACACTCTTTCCCTACACGACGCTCTTCCGATCT';
+  my $pe2 = 'GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT';
+  my $pe1_rc = 'AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA';
+  my $pe2_rc = 'AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC';
+
+  
+  my $trimmomatic = $opts{t};
+  die(qq/\nHmm...I could not locate where the trimmomatic executable is.. Check "-t"? \n\n/) unless -e $trimmomatic;
+  
+  my $cutadapt = 'cutadapt';
+  my $flash = 'flash';
+  my $bowtie = 'bowtie2';
+  my $cope = 'cope';
+  my $readLength = $opts{l};
+  my $nper = $opts{n};
+  my $aper = $opts{r};
+  my $minLength = $opts{h};
+  my $mismat = $opts{m};
+
+ 
+
+  my @files;
+  if ($opts{d} eq "all") {
+    @files = <$dir*_R1.fq>; 
+    die(qq/\nHmm...I do not know where you are hiding your raw sequence files... Check "-d" and\/or "-f"? \n\n/) if (scalar(@files) == 0);
+    print "\n","OK! Now processing all data files!", "\n";
+  }
+  
+  else {
+    @files = <$dir*$opts{d}_R1.fq>; 
+    die(qq/\nHmm...I do not know where you are hiding your raw sequence files... Check "-d" and\/or "-f"? \n\n/) if (scalar(@files) == 0);
+    print "\n","OK! Now processing library $opts{d}!", "\n";
+    
+  }
+  
+  foreach my $file1 (@files) {
+    open (IN,"<",$file1);
+    my $firstline = <IN>;
+    $InID = $1 if ($firstline =~ m/^\@([^:]+):/ );
+    print "can not find instrument ID!\n" if ($firstline !~ m/^\@[^:]+:/);
+    exit if ($firstline !~ m/^\@[^:]+:/);
+    close IN;
+     
+    my $file2 = $file1;
+    $file2 =~ s/_R1/_R2/;
+    my $lib = $1 if basename($file1) =~ m/(\S+)_R[1|2]\.f/i;   
+    
+   
+    my $start1 = time;	
+    if ($rd == 1) {
+      my $rawdr = $dir . "orginal/";
+      mkdir $rawdr unless -e $rawdr;    
+      my ($file1, $file2) = remove_dup($file1, $file2, $lib, $dir, $rawdr);
+    }
+    
+    my $time1 = int((time - $start1)/60);  
+    if ($rd == 0 ) {
+      print "All duplicates are kept...\n";
+    }
+    if ($rd == 1 ) {
+      print "Found duplicates in $lib in $time1 minutes! All duplicates will be removed...\n";
+    }
+    
+    my $start2 = time;
+    my $low = $outdir . $lib . '.lowComplexity.out';
+    removeLowComplexity($file1,$low,$nper,$aper);
+    removeLowComplexity($file2,$low,$nper,$aper);
+    my $time2 = int((time - $start2)/60);
+    print "Found low complexity reads in $lib in $time2 minutes! Whew, almost there!\n";
+    
+    my $start3 = time;
+    my %reads = ('1' => $file1, '2' => $file2);
+    #my $ad = getAdaptors($lib,$adaptorFile,$libInfo,$index,$uniad);
+    
+    my ($outp1, $outp2) = cutadatpair ($cutadapt, $dir, $lib, $file1, $file2);
+    #my ($outp1, $outp2) = skewer ($dir, $lib, $file1, $file2, $P1, $P2, $minLength, $cpu);
+    my ($outpair1, $outpair2, $merge) = trimmomaticpair ($lib, $pe1, $pe2, $pe1_rc, $pe2_rc, $pe1, $pe2, $outp1,  $outp2, 'trim1', $trimmomatic, $minLength, $cpu, $quality);
+    #my ($outpair1, $outpair2, $merge) = trimmomaticpair ($lib, $pe1, $pe2, $outp1, $outp2, 'trim1', $trimmomatic, $minLength, $cpu, $quality);
+   
+    %reads = ('1' => $outpair1, '2' => $outpair2, 'u2' => $merge);
+    #my $reads4 = mergeReads($lib,\%reads,\%reads,"merge",$readLength,$flash,$InID, $opts{g},$opts{e});
+    #my $reads4 = reallyMergeReads($lib,\%reads,$reads2,"trim4","trim5",$InID);
+   
+    my $start4 = time;
+    my $contaminants = $outdir . $lib . '.contam.out';
+    removeContamination(\%reads,$contam,$contaminants,$bowtie,'pe', $cpu, $mismat);
+   
+    my $time4 = int((time - $start4)/60);
+    print "Removed contamination in $lib in $time4 minutes! It's going...\n";	
+    
+    makeFinal($outdir,$lib,\%reads,$low,$contaminants, $InID);
+    
+    system("rm $dir*$lib*paired*");
+    system("rm $dir*$lib*.u");
+    system("rm $dir*$lib*trimmed*");
+    
+  }
+  if ($opts{z}) {
+    print "\n","start evaluating ... OH WOW! Your sequence data are looking much better now!" , "\n\n";
+    my @clean;
+    
+    if ($opts{d} eq "all") {
+      @clean = < $outdir*_final.fq> ;
+    }
+    
+    else {
+      @clean = <$outdir$opts{d}*_final.fq>; 
+    }
+    
+    my $resdir =  $outdir.'evaluation/';
+    mkdir $resdir unless -e $resdir;
+    foreach (<@clean>) {
+      my $lib = $1 if basename($_) =~ m/(\S+)_[1|2|u]_final.fq/; 
+      my $call1 = system("fastqc -t 2 $_ -o $resdir");
+      die(qq/\nThe program "fastQC" is not in path! \n\n/) if ($call1 == -1 );
+    
+      system ("rm $resdir$lib*fastqc.zip");
+    }
+    
+  }	
+  print "\n","Congratulations! The cleanup step is done... Now what?" , "\n\n"; 
+}
+
+sub skewer {
+ my ($outdir, $lib, $file1, $file2,$P1, $P2, $minLength, $cpu) = @_;
+ my $outp1 = $outdir . $lib . "_R1-trimmed-pair1.fastq";
+ my $outp2 = $outdir . $lib . "_R1-trimmed-pair2.fastq";
+
+ system ("skewer -t $cpu  -x $P1 -y $P2 $file1 $file2 -m pe -l $minLength ");
+ #system ("rm $outdir*$lib*masked*");
+ return ($outp1, $outp2);
+}
+
+sub skewersingle {
+  my ($outdir, $lib, $file1, $P1,$P2, $minLength, $cpu) = @_;
+  my $outp1 = $outdir . $lib . "_R1-trimmed.fastq";
+
+  my $adfile = $outdir. $lib . "_adfile.fa";
+  open(OUT, ">" ,$adfile);
+  print OUT  ">adapter1", "\n";
+  print OUT $P1, "\n";
+  print OUT ">adapter2", "\n";
+  print OUT $P2, "\n";
+  close OUT;
+  
+  system ("skewer -t $cpu  -x $adfile  $file1  -m any -l $minLength ");
+  #system ("rm $outdir*$lib*masked*"); 
+  system ("rm $adfile");
+  return ($outp1);
+}
+
+
+sub getAdaptors {
+  my ($lib,$adaptorFile,$libInfo,$index,$uniad) = @_;
+  
+  my %lib;
+  open(IN, "<$libInfo");
+  
+  my $header = <IN>;
+  
+  while(<IN>) {
+    chomp(my $line = $_);
+    my @d = split(/\s+/,$line);
+    next if $d[0] =~ /^$/;
+    if ($d[2]) {
+      $lib{$d[0]} = {'P7'=>$d[1], 'P5'=>$d[2]};
+    }
+    if (!$d[2]) {
+      $lib{$d[0]} = {'P7'=>$d[1]};
+    }
+  }
+  close(IN);
+  
+  my %P7;
+  my %P5;
+  
+  
+  open(IN, "<$adaptorFile");
+  while(<IN>) {
+    chomp(my $line = $_);
+    next if $line =~ /^$/;
+    if ($line =~ m/>P7_index(\d+)/) {
+      my $bc = $1;
+      chomp(my $seq = <IN>);
+      $P7{$bc} = $seq;
+    }
+    if ($line =~ m/>P5_index(\d+)/) {
+      my $bc2 = $1;
+      chomp(my $seq2 = <IN>);
+      $P5{$bc2} = $seq2;
+    }
+    
+  } 
+  close(IN);	  
+  my %ad;
+  if ($index == 1) {
+    %ad = ("uni" => $uniad, "uni_rc" => rc($uniad), "index" => $P7{$lib{$lib}{'P7'}}, "index_rc" => rc($P7{$lib{$lib}{'P7'}}));
+    die(qq/\nHmm...I could not find the adapter sequences for $lib ... Check the naming of the adapter sequences in "-a". \n\n/) if (!$ad{"index"});
+  }
+  if ($index == 2) {
+    %ad = ("uni" =>$P5{$lib{$lib}{'P5'}}, "uni_rc" => rc($P5{$lib{$lib}{'P5'}}), "index" => $P7{$lib{$lib}{'P7'}}, "index_rc" => rc($P7{$lib{$lib}{'P7'}}));
+    die(qq/\nHmm...I could not find the adapter sequences for $lib ... Check the naming of the adapter sequences in "-a". \n\n/) if (!$ad{"index"} || !$ad{"uni"});
+    
+  } 
+  
+  return(\%ad);
+}
+
+sub rc {
+  my ($seq) = @_;
+  my $rc = $seq;
+  $rc = reverse($rc);
+  $rc =~ tr/ATGCatgc/TACGtacg/;
+  return($rc);
+}
+
+sub removeContamination {
+  my ($reads,$contam,$contaminants,$bowtie, $suf, $cpu, $mismat) = @_;
+  #\%reads,$contam,$contaminants,$bowtie,'se', $cpu, $mismat)
+  unless (-f $contam . ".3.bt2") {
+    my $bw2build = $bowtie . "-build";
+    my $call1 = system("$bw2build $contam $contam");
+  } 
+  my %reads = %{$reads};
+  
+  if ($suf eq 'pe') {              
+  my $contamout1 = $reads{'1'} . ".contam.sam1";
+  my $call2 = system("$bowtie -x $contam -1 $reads{'1'} -2 $reads{'2'} -p $cpu --fast -S $contamout1 --sam-nohead --sam-nosq");
+  die(qq/\nThe program "bowtie2" is not in path! \n\n/) if ($call2 == -1 );
+  #my $contamout2 = $reads{'1'} . ".contam.sam2";
+  #my $contamout3 = $reads{'1'} . ".contam.sam3";
+  #my $call3 = system("$bowtie -x $contam -U $reads{'u'} --fast -S $contamout2 --sam-nohead --sam-nosq");
+  #my $call4 = system("$bowtie -x $contam -U $reads{'u2'} --fast -S $contamout3 --sam-nohead --sam-nosq");
+
+  my $contamout_all = $reads{'1'} . ".contam_all.sam" ;
+  #system ("cat $contamout1 $contamout2 $contamout3 > $contamout_all");
+  system ("mv $contamout1 $contamout_all");
+  parseSAM ($contaminants,$contamout_all, $mismat);
+  #system ("rm $contamout1 $contamout2 $contamout3");
+  }
+  if ($suf eq 'se') {
+    my $contamout1 = $reads{'1'} . "contam.sam1";  
+    my $call3 = system("$bowtie -x $contam -U $reads{'1'} -p $cpu --fast -S $contamout1 --sam-nohead --sam-nosq");
+    parseSAM ($contaminants,$contamout1, $mismat);
+   
+ }
+     
+}
+#1H56M1D43M
+
+sub parseSAM {
+  my ($contaminants,$contam,  $mismat) = @_;
+  open(OUT, ">$contaminants");
+  open(IN, "<$contam");
+  
+  while(<IN>) {
+    chomp(my $line = $_);
+    my @d = split(/\t/,$line);
+    if ($d[2] !~ m/\*/) {
+      if ($d[5] =~ m/\d+M/) {
+	my @sum = ($d[5] =~ m/(\d+)/);
+	my $length = sum (@sum);
+	my $md = $1 if $line =~ m/(MD\:Z\S+)/;
+	my @a = ($md =~ m/([ATGC])/g);
+	if (scalar(@a)/$length < 1 - $mismat) {
+	  $d[0] =~ s/\/[1|2]$//;
+	  print OUT $d[0], "\n";
+	}
+      }
+    }
+  }
+  close(IN); close(OUT);  
+  #unlink($contam);
+}       
+ 
+
+
+ sub remove_dup1 {
+  my ($file1, $file2, $leading, $dup,$InID) = @_;
+  open (my $fh1, $file1);
+  open (my $fh2, $file2);
+  
+  open (OUT, ">", $dup);
+  my $line1=readline($fh1);
+  my $line2=readline($fh2);
+  
+  my $count=1;
+  my %hash;
+  
+  my $id;
+  while ($line1) {
+    if  ($count % 4 == 1) {
+      $id = $1 if $line1 =~ m/^\@($InID\S+)\/[1|2]$/; 
+    } 
+    if ( $count % 4 == 2 ) {
+      my $part1;
+      my $part2;
+      
+      chomp($line1);
+      chomp($line2);    
+      
+      $part1 = substr($line1, 0,  $leading);
+      $part2 = substr($line2, 0,  $leading);
+      
+      my $key= $part1 .  $part2;
+
+      if ($hash{$key}) {
+	print OUT $id, "\n";
+      }
+      else {
+	$hash{$key}++;
+      }  
+    }  
+    $line1=readline($fh1);
+    $line2=readline($fh2);
+    $count++;
+  }  
+}
+
+
+
+sub removeLowComplexity {
+  my ($file,$low,$nper,$aper) = @_;
+  open(IN, "<$file");
+  open(OUT, ">>$low");
+  while(<IN>) {
+    chomp(my $line = $_);		
+    if ($line =~ m/^@(\S+)\/[1|2]$/) {
+      my $id = $1;
+      chomp(my $seq = <IN>);
+      my $n = int($nper*length($seq));
+      my $a = int($aper*length($seq));
+      my $ncounter = ($seq =~ m/N/g);
+      if ($seq =~ m/[A]{$a}/i || $seq =~ m/[T]{$a}/i || $seq =~ m/[G]{$a}/i || $seq =~ m/[C]{$a}/i || $ncounter >= $n) {
+	print OUT $id, "\n";
+      }
+    }
+  }	
+  close(IN); close(OUT);	
+}
+
+sub mergeReads {
+  my ($lib,$orig,$reads,$base, $readLength, $flash,$InID, $g, $e) = @_;
+  #($lib,\%reads,\%reads,"trim2",$readLength,$flash,$InID, $opts{g},$opts{e});
+  my %reads = %{$reads};
+  
+  my $newread1 = $orig->{'1'} . '_' . $base . '_p1';
+  my $newread2 = $orig->{'2'} . '_' .$base .'_p2';
+  my $newreadu = $orig->{'1'} . '_' .$base .'_u';
+  
+  my $call1 = system("$flash $reads{'1'} $reads{'2'} -M $readLength -m 10 -x $g  --allow-outies  -o $lib");
+  die(qq/\nThe program "flash" is not in path! \n\n/) if ($call1 == -1 );
+  
+  open (EXTEND,"<",  $lib . ".extendedFrags.fastq");
+  open (NEW, ">",  $lib . ".extendedFrags.fastq1");
+  while (<EXTEND>) {
+    chomp(my $line = $_);	
+    if ($line =~ m/^@($InID\S+)/) {
+      my $new_line =  $line . "/1";
+      my $seq =<EXTEND>;
+      my $qualid = <EXTEND>;
+      my $qual = <EXTEND>;
+      print NEW $new_line , "\n" , $seq , $qualid , $qual;
+    } 
+  }
+  close EXTEND;
+  close NEW;
+  my $call2 = system("cat $reads{'u'} $lib\.extendedFrags.fastq1 > $newreadu");
+  my $call3 = system("mv $lib\.notCombined_1.fastq $newread1");
+  my $call4 = system("mv $lib\.notCombined_2.fastq $newread2");
+  my $call5 = system("rm $lib\.extendedFrags.fastq $lib\.extendedFrags.fastq1  $lib\.hist*");
+  
+  my %newreads = ('1' => $newread1,'2' => $newread2, 'u' => $newreadu);
+  return(\%newreads);
+}
+
+sub reallyMergeReads {
+  my ($lib,$orig,$reads,$base1,$base2,$InID) = @_;	
+  
+  my %reads = %{$reads};	
+  my $newread1 = $orig->{'1'} . '_' . $base1 . '_p1';
+  my $newread2 = $orig->{'2'} . '_' .$base1 .'_p2';
+  my $newreadu = $orig->{'1'} . '_' .$base1 .'_u';
+  my $call1 = system("cope -a $reads{'1'} -b $reads{'2'} -o $lib\.copemerged -2 $newread1 -3 $newread2 -m 0 -l 10 -c 0.99 -s 33");
+  die(qq/\nThe program "cope" is not in path! \n\n/) if ($call1 == -1 );
+  
+  my $newerread1 = $orig->{'1'} . '_' . $base2 . '_p1';
+  my $newerread2 = $orig->{'2'} . '_' .$base2 .'_p2';
+  my $newerreadu = $orig->{'1'} . '_' .$base2 .'_u';
+  my %newerreads = ('1' => $newerread1,'2' => $newerread2, 'u' => $newerreadu);
+  
+  open (COPE, "<", $lib . ".copemerged");
+  open (COPE_NEW, ">", $lib . ".copemerged1");  
+  while (<COPE>) {
+    chomp(my $line = $_);
+    my @f = split /\s+/,$line;
+    if (scalar(@f) == 4) {
+      if ($f[1] =~ m/^($InID\S+)(\/1)(_$InID\S+)\/[1|2]$/) {
+	my $full_id = $1 . $2 . $3;
+	my $seq = <COPE>; my $qualid = <COPE>; my $qual = <COPE>;
+	print COPE_NEW "@",$1,$2,"\n", $seq,$qualid,$qual;
+	
+      }
+    }
+    if (scalar(@f) == 2) {
+      if ($f[0] =~ m/^@($InID\S+)(\/1)(_$InID\S+)\/[1|2]$/) {
+	my $full_id = $1 . $2 . $3;
+	my $seq = <COPE>; my $qualid = <COPE>; my $qual = <COPE>;
+	print COPE_NEW "@",$1,$2,"\n", $seq,$qualid,$qual;	
+      }
+    }
+  }
+  close COPE;
+  close COPE_NEW;
+  
+  my $call3 = system("cat $lib\.copemerged1 $reads{'u'} > $newerreadu");
+  my $call4 = system("mv $newread1 $newerread1");
+  my $call5 = system("mv $newread2 $newerread2");
+  my $call6 = system("rm $lib\.copemerged $lib\.copemerged1 ");
+  return(\%newerreads);
+}
+
+
+
+sub fixMatePair {
+  my ($lib,$read,$readarray,$base, $InID) = @_;
+  my @trim = @{$readarray};
+  my %pair;	
+  foreach my $reads (@trim) {
+    open(IN, "<$reads");
+    while(<IN>) {
+      chomp(my $line = $_);
+      if ($line =~ m/^@($InID\S+)\/[1|2]$/) {
+	$pair{$1}++;
+	chomp(my $seq = <IN>); chomp(my $qualid = <IN>); chomp(my $qual = <IN>);
+      }
+    }
+    close(IN);	
+  }
+  my %reads = %{$read};
+  my $out1 = $reads{'1'} . '_' . $base . '_p1';
+  my $out2 = $reads{'2'} . '_' . $base . '_p2';
+  my $outu = $reads{'1'} . '_' . $base . '_u';
+  print $out1, "\n"; 
+  print $out2, "\n";
+  print $outu, "\n";
+  open(OUT1, ">$out1"); 
+  open(OUT2, ">$out2"); 
+  open(OUTU, ">$outu"); 
+  my %newpairs = ('1' => $out1, '2' => $out2, 'u' => $outu);
+  foreach my $reads (@trim) {
+    open(IN, "<$reads");
+    my $file = $1 if $reads =~ m/_R(\d+)\./;
+    while(<IN>) {
+      chomp(my $line = $_);	
+      if ($line =~ m/^@($InID\S+)\/[1|2]$/) {
+	my $id = $1;
+	my $seq = <IN>;
+	my $qualid = <IN>;
+	my $qual = <IN>;
+	if ($pair{$id} == 2) {
+	  if ($file == 1) {
+	    print OUT1 $line . "\n" . $seq . $qualid . $qual;
+	  }
+	  else {
+	    print OUT2 $line . "\n" . $seq . $qualid . $qual;
+	  }
+	}
+	else {
+	  print OUTU $line . "\n" . $seq . $qualid . $qual;
+	}
+      }	
+    }
+    close(IN);	
+  }	
+  close(OUT1); close(OUT2); close(OUTU);	
+  return(\%newpairs);
+}
+
+sub trimmomaticpair {
+  my ($lib, $P1, $P2, $a, $b, $c, $d, $read1, $read2, $base, $trimmomatic,$minLength,$cpu, $quality) = @_;
+ 
+  my $outpair1 = $read1 . ".paired";
+  my $outpair2 = $read2 . ".paired";
+  my $outunpair1 = $read1 . ".unpaired";
+  my $outunpair2 = $read2 . ".unpaired";
+  my $merge = $read1 . ".u";
+  
+  my $adfile = $read1 . "_adfile.fa";
+  open(OUT, ">" ,$adfile);
+  print OUT  ">adapter/1", "\n";
+  print OUT $P1, "\n";
+  print OUT ">adapter/2", "\n";
+  print OUT $P2, "\n";
+  print OUT ">adapters1", "\n";
+  print OUT $c, "\n";
+  print OUT ">adapters2", "\n";
+  print OUT $a, "\n";
+  print OUT ">adapters3", "\n";
+  print OUT $d, "\n";
+  print OUT ">adapters4", "\n";
+  print OUT $b, "\n";
+  
+  close OUT;
+  
+  my $call2 = system ("java -jar $trimmomatic PE -threads $cpu -phred33 $read1 $read2 $outpair1 $outunpair1 $outpair2 $outunpair2 ILLUMINACLIP:$adfile:2:30:10 SLIDINGWINDOW:4:$quality MINLEN:$minLength LEADING:3 TRAILING:3");
+ 
+  system ("cat $outunpair1 $outunpair2 > $merge");
+  
+  unlink($adfile, $outunpair1, $outunpair2);
+  return($outpair1, $outpair2, $merge);
+}
+
+
+sub trimmomatic {
+  my ($lib,$P1,$P2, $P3, $P4,$in,$base,$suffix, $trimmomatic,$minLength, $cpu, $quality) = @_;
+  my $out = $base . '_' . $suffix;	
+  my $adfile = $in . "_adfile.fa";
+  open(OUT, ">" ,$adfile);
+  print OUT  ">single1", "\n";
+  print OUT $P1, "\n";
+  print OUT ">single2", "\n";
+  print OUT $P2, "\n";
+  print OUT  ">single3", "\n";
+  print OUT $P3, "\n";
+  print OUT ">single4", "\n";
+  print OUT $P4, "\n";
+  close OUT;
+  
+  my $call1 = system("java -jar $trimmomatic SE -threads $cpu  -phred33 $in $out ILLUMINACLIP:$adfile:2:30:10 SLIDINGWINDOW:4:$quality MINLEN:$minLength LEADING:3 TRAILING:3");
+  unlink($adfile);
+  return($out);
+}
+
+sub cutadapt {
+  my ($ad,$in,$base,$suffix, $cutadapt,$minLength) = @_;
+  my $out  = $base . '_' . $suffix;	
+  my $curRead = $in;
+  my $tracker = 1;
+  my %ad = %{$ad};
+  foreach my $key (keys %ad) {
+    my $out = $curRead . $tracker;
+    my $call = system("$cutadapt -b $ad{$key} -O 4 -n 5 -e 0.15 -f fastq $curRead -o $out -m $minLength");
+    die(qq/\nThe program "cutadapt" is not in path! \n\n/) if ($call == -1 );
+    unlink($curRead) unless($curRead eq $in);
+    $curRead = $out;
+    $tracker++;
+  }
+  my $call2 = system("mv $curRead $out");
+  return($out);
+}
+
+sub bowtie {
+  my ($lib, $ad,$in,$base,$suffix,$bowtie,$minLength, $cpu) = @_;
+  my $out  = $base . '_' . $suffix;	
+  my $file = $lib."out.sam";
+  
+  my $adfile = $lib . "_adfile_norev.fa";
+  open(OUT, ">$adfile");
+  foreach my $name (keys %{$ad}) {
+    print OUT ">", $name, "\n", $ad->{$name}, "\n" unless $name =~ m/rc/;
+  }
+  close(OUT);	
+  
+  my $bw2build = $bowtie . "-build";
+  my $call1 = system("$bw2build $adfile $adfile");
+  my $call2 = system("$bowtie --local -D 15 -R 2 -N 1 -L 10 -i S,1,0.75 -p $cpu -k 1 -x $adfile -U $in -S $file");
+  die(qq/\nThe program "bowtie2" is not in path! \n\n/) if ($call2 == -1 );
+  my $call3 = system("rm $adfile" . "*");
+  
+  open(IN, "<$file");
+  open(OUT, ">$out");
+  
+  while(<IN>) {
+    chomp(my $line1 = $_);
+    my @d1 = split(/\t/,$line1);
+    
+    my $seq1 = $d1[9];
+    my $qual1 = $d1[10];
+    
+    unless($line1 =~ m/^@/) {
+      if ($line1 !~ m/\*/) {			
+	if ($d1[5] =~ m/^(\d+)S\d+M$/) {
+	  my $l = $1;
+	  $seq1 = substr $seq1, 0, $l;
+	  $qual1 = substr $qual1, 0, $l;
+	}
+	elsif ($d1[5] =~ m/^(\d+)M\d+S$/) {
+	  my $start = $1;
+	  $seq1 = substr $seq1, $start;
+	  $qual1 = substr $qual1, $start;
+	}
+	else {
+	  my @s;
+	  while ($d1[5] =~ m/(\d+)S/g) {
+	    push(@s,$1);
+	  }
+	  @s = sort {$a <=> $b} @s;
+	  if ($s[$#s] >= $minLength) {	
+	    if ($d1[5] =~ m/^(\S*)$s[$#s]/) {
+	      my $match = $1;
+	      my $length = $s[$#s];
+	      my $start = 0;
+	      while ($match =~ m/(\d+)/g) {
+		$start += $1;
+	      }
+	      $seq1 = substr $seq1, $length;
+	      $qual1 = substr $qual1, $length;	
+	    }													
+	  }
+	  else {
+	    $seq1 = 'N'; $qual1 = 'N';
+	  }
+	}
+      }
+      
+      if (length($seq1) >= $minLength) {	
+	print OUT "@" . $d1[0] . "\n" . $seq1 . "\n" . '+' . "\n" . $qual1 . "\n";	
+      }
+    }	
+  }	
+  unlink($file);
+  close(IN); close(OUT);	
+  return($out);
+}
+
+
+sub redir {
+  my ($dir) = @_;
+  my $out;
+  if ($dir =~ m/\/$/ ){
+    $out = $dir; 
+  }
+  else {
+    $out = $dir . "/";
+  }
+  return ($out);
+}
+
+
+
+#now convert the raw data files to format compatible to downstream analyses
+sub rawclean {
+  my ($rawdir) = @_;
+  my $Result_dir1 = $rawdir . 'combined/';
+  mkdir $Result_dir1 unless -e  $Result_dir1;
+  my $dir = $rawdir . 'pre-clean/';
+  mkdir $dir unless -e  $dir;
+  
+  my @orig_files = <$rawdir*.gz>; 
+  
+  die(qq/\nHmm...Is it the right folder? \n\n/) if (scalar (@orig_files) == 0);
+  
+  foreach (<@orig_files>) {
+    my $file = basename($_) =~ /(\S+_R[1|2])_\d+\.fastq.gz/;
+    die(qq/\nHmm...the name of the library doesn't match. Check\/modify line 34 of this script. \n\n/) if (!basename($_));
+    my $lib_name = $1;
+    my $file2 = $rawdir . $1 .  '*'. '.fastq.gz';
+    my $combined = $Result_dir1 . $1 . '.fastq.gz'; 
+    system ("cat $file2 > $combined ") unless -e $combined;
+  }
+  
+  my @merged_files = < $Result_dir1*.fastq.gz> ;
+  
+  foreach my $file (<@merged_files>) {
+    my $out = $dir .  $1 . $2 . ".fq" if basename($file)  =~ /(\S+)+_L\d+(_R[1|2])\.fastq.gz/;
+    my $redundancy = '^--$' ; 
+    print "cleaning","\t",$file,"\n";
+    if ($file =~ m/_R(\d+)\.fastq.gz/) {
+      if ($1 == 1) {
+	system ("gunzip -c $file | grep -A 3 \'^@.* [^:]*:N:[^:]*:\'  | grep -v $redundancy | sed \'s/ 1:N:0:.*/\\/1/g\' > $out");
+      }
+      if ($1 == 2) {
+	system ("gunzip -c $file | grep -A 3 \'^@.* [^:]*:N:[^:]*:\' | grep -v $redundancy | sed  \'s/ 2:N:0:.*/\\/2/g\' > $out");
+      }  
+    }
+  }
+  return ($dir);
+}
+
+
+
+
+sub cleanSE {
+  die (qq/
+
+Usage: scrubReads cleanSE [options]
+
+External dependencies:
+"skewer", "bowtie2", "fastQC", "trimmomatic"
+
+Options:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+-f     DIR      Path to the folder of raw fastq files
+-o     DIR      Path to the results folder
+-t     FILE     Path to trimmoatic executable
+-c     FILE     Contaminant file
+-m     FLOAT    percent similarity to contaminant file to
+                consider a read to be a contaminant
+                [0.90]
+-k     INT      Number of threads needed for bowtie2 alignment 
+                (remove contamination), skewer(trimming adapters) 
+                and trimmomatic (trimming adapters and low qual) [4]
+-q     INT      Quality trimming threhold [23]
+-d     CHAR     The particular library that you like to process,
+                if "all" is specified, all libraries in the folder
+                (-f) will be processed sequenctially [all]
+-l     INT      Read length [100]
+-n     FLOAT    Will get rid of reads for which more than
+                n*100\% of bases are NNs [0.6]
+-r     FLOAT    Will get rid of reads with any runs of bases
+                longer than r*read_length [0.5]
+-h     INT      Trimmomatic trimming length cutoff [36]
+-z              If z is supplied, use fastQC to evaluate
+                cleaned sequence reads [null]
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+\n/) if !@ARGV;
+
+my %opts = (f=>undef, o=>undef,t=>undef, c=>undef,  k=> 4, q=> 23, l=>100, n=>0.6, r=>0.5,  d=>"all", h=>36,m=>0.9);
+getopts('f:o:t:c:l:n:r:d:h:k:q:m:z', \%opts);
+
+  my $dir = redir ($opts{f});
+  my $outdir = redir ($opts{o});
+ 
+  mkdir ($outdir) unless -d ($outdir);
+  
+  
+  my $contam = $opts{c};
+  die(qq/\nHmm...I could not find where the contaminant file is.. Check "-c"? \n\n/) unless -e $contam;
+  
+  #universal adapter P5 if no barcode is used in it
+  my $uniad = 'AATGATACGGCGACCACCGAGATCTACACTCTTTCCCTACACGACGCTCTTCCGATCT';
+  
+  my $pe1 = 'TACACTCTTTCCCTACACGACGCTCTTCCGATCT';
+  my $pe2 = 'GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT';
+  my $pe1_rc = 'AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA';
+  my $pe2_rc = 'AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC';
+
+  
+  
+  my $trimmomatic = $opts{t};
+  die(qq/\nHmm...I could not locate where the trimmomatic executable is.. Check "-t"? \n\n/) unless -e $trimmomatic;
+  my $cpu = $opts{k};
+  my $quality = $opts{q};
+  my $bowtie = 'bowtie2';
+  my $readLength = $opts{l};
+  my $nper = $opts{n};
+  my $aper = $opts{r};
+  my $minLength = $opts{h};
+  my $InID; 
+  my $maxmis = $opts{g};
+  my $mismat = $opts{m};
+  my $cutadapt = 'cutadapt';
+
+  
+  my @files;
+  if ($opts{d} eq "all") {
+    @files = <$dir*_R1.fq>; 
+    die(qq/\nHmm...I do not know where you are hiding your raw sequence files... Check "-d" and\/or "-f"? \n\n/) if (scalar(@files) == 0);
+    print "\n","OK! Now processing all data files!", "\n";
+  }
+  
+  else {
+    @files = <$dir*$opts{d}_R1.fq>; 
+    die(qq/\nHmm...I do not know where you are hiding your raw sequence files... Check "-d" and\/or "-f"? \n\n/) if (scalar(@files) == 0);
+    print "\n","OK! Now processing library $opts{d}!", "\n";
+  }
+  
+  
+  foreach my $file1 (@files) {
+    open (IN,"<",$file1);
+    my $firstline = <IN>;
+    $InID = $1 if ($firstline =~ m/^\@([^:]+):/ );
+    print "can not find instrument ID!\n" if ($firstline !~ m/^\@[^:]+:/);
+    exit if ($firstline !~ m/^\@[^:]+:/);
+    close IN;
+
+    
+    my $lib = $1 if basename($file1) =~ m/(\S+)_R1/i;   
+    
+    #################find low complexity#####################
+    my $start2 = time;
+    my $low = $outdir . $lib . '.lowComplexity.out';
+    removeLowComplexity($file1,$low,$nper,$aper); 
+    my $time2 = int((time - $start2)/60);
+    print "Found low complexity reads in $lib in $time2 minutes! Whew, almost there!\n";
+    #########################################################
+    
+    ##############trim adapter and merging###################
+    my $start3 = time;
+    my %reads = ('1' => $file1);
+    #my $ad = getAdaptors($lib,$adaptorFile,$libInfo,$index,$uniad);
+    my $final1;  
+    #my ($outp1) = skewersingle ($dir, $lib, $file1, $P1, $P2, $minLength, $cpu);
+    my $outp1 = cutadaptsingle ($cutadapt, $dir, $lib, $file1);
+    my $out1 = trimmomatic($lib, $pe1, $pe2, $pe1_rc, $pe2_rc,$outp1,$outp1,'trim1',$trimmomatic,$minLength, $cpu, $quality);
+                     
+    $final1 = $file1 . '_cleaned1';
+    my $call = system("mv $out1 $final1");
+    
+    
+    my $time3 = int((time - $start3)/60);
+    print "Trimmed in $lib in $time3 minutes! Whew, almost there!\n";
+    #########################################################
+    
+    
+    #################remove contaminaitons###################
+    my $start4 = time;
+    my $contaminants = $outdir . $lib . '.contam.out';
+    my $suf = 'se';
+    %reads = ('1' => $final1);
+    removeContamination(\%reads,$contam,$contaminants,$bowtie,'se', $cpu, $mismat);
+    my $time4 = int((time - $start4)/60);
+    print "Removed contamination in $lib in $time4 minutes! It's going...\n";	
+    #########################################################
+    
+    
+    ######################make final files###################
+    makeFinalSE ($outdir,$lib,$final1,$low,$contaminants,$InID);
+    
+    my $call_rm1 = system("rm $dir*$lib*clean*");
+    my $call_rm2 = system("rm $dir*$lib*trim*");
+   
+  }
+  
+  if ($opts{z}) {
+    print "\n","start evaluating ... OH WOW! Your sequence data are looking much better now!" , "\n\n";
+    my @clean;
+    
+    if ($opts{d} eq "all") {
+      @clean = < $outdir*_final.fastq> ;
+    }
+    
+    else {
+      @clean = <$outdir$opts{d}*_final.fastq>; 
+    }
+    
+    my $resdir =  $outdir.'evaluation/';
+    mkdir $resdir unless -e $resdir;
+    foreach (<@clean>) {
+      my $lib = $1 if basename($_) =~ m/(\S+)_[1|2|u]_final.fq/; 
+      my $call1 = system("fastqc -t 2 $_ -o $resdir");
+      die(qq/\nThe program "fastQC" is not in path! \n\n/) if ($call1 == -1 );
+      system ("rm $resdir$lib*fastqc.zip");
+    }
+    
+  }	
+  
+  print "\n","Congratulations! The cleanup step is done... Now what?" , "\n\n"; 
+  #############################################################
+}
+
+sub cutadaptsingle {
+  my ($cutadapt, $dir, $lib, $file1) = @_;
+  my $outp1round1 = $dir . $lib . "_read1_cutadapt1.fq";
+  my $outp1round2 = $dir . $lib . "_read1_cutadapt2.fq";
+
+  system ("$cutadapt -b AGATCGGAAGAGC -n 5 -f fastq -o  $outp1round1 $file1 ");
+  system ("$cutadapt -b GCTCTTCCGATCT -n 5 -f fastq -o  $outp1round2 $outp1round1");
+
+  unlink ($outp1round1);
+  return ($outp1round2);
+}
+
+sub cutadatpair {
+  my ($cutadapt, $dir, $lib, $file1, $file2) = @_;
+  my $outp1round1 = $dir . $lib . "_read1_cutadapt1.fq";
+  my $outp2round1 = $dir . $lib . "_read2_cutadapt1.fq";
+  my $outp1round2 = $dir . $lib . "_read1_cutadapt2.fq";
+  my $outp2round2 = $dir . $lib . "_read2_cutadapt2.fq";
+
+  system ("$cutadapt -b AGATCGGAAGAGC -B AGATCGGAAGAGC -n 5 -f fastq -o  $outp1round1 -p $outp2round1 $file1 $file2");
+  system ("$cutadapt -b GCTCTTCCGATCT -B GCTCTTCCGATCT -n 5 -f fastq -o  $outp1round2 -p $outp2round2 $outp1round1 $outp2round1");
+
+  unlink ($outp1round1, $outp2round1);
+  return ($outp1round2, $outp2round2);
+}
+
+sub makeFinalSE {
+  my ($outdir, $lib,$reads,$low,$contam,$InID) = @_;
+  
+  my %junk;
+ 
+  open(IN, "<$low");
+  while(<IN>){
+    chomp(my $line = $_);
+    $junk{$line}++;
+  }
+  close(IN);
+  
+  open(IN, "<$contam");
+  while(<IN>) {
+    chomp(my $line = $_);
+    $junk{$line}++;
+  }
+  close(IN);
+  
+  my $new1 = $outdir . $lib . "_1_final.fastq";
+      
+      open(IN, "<", $reads);
+      open(OUT, ">", $new1);
+      while(<IN>) {
+	chomp(my $line = $_);
+	my @line =split (/\t+/, $line);
+	if (scalar(@line) == 1) {
+	  if ($line[0] =~ m/^@($InID\S+)\/1$/) {
+	    my $id = $1;
+	    my $seq = <IN>; my $qualid = <IN>; my $qual = <IN>;
+	    unless($junk{$id}){
+	      print OUT "@", $id , "/1", "\n", $seq,$qualid,$qual;
+	    }
+	  }
+	}	    
+      }
+      close(IN); close(OUT);
+}
+
+
+
+sub makeFinal {
+  my ($outdir, $lib,$reads,$low,$contam, $InID) = @_;
+
+  my %junk;
+   
+  open(IN, "<$low");
+  while(<IN>){
+    chomp(my $line = $_);
+    $junk{$line}++;
+  }
+  close(IN);
+  
+  open(IN, "<$contam");
+  while(<IN>) {
+    chomp(my $line = $_);
+    $junk{$line}++;
+  }
+  close(IN);
+  
+  my $new1 = $outdir . $lib . "_1_final.fastq";
+  my $new2 = $outdir . $lib . "_2_final.fastq";
+  my $newuS = $outdir . $lib . "_Unpaired_final.fastq";
+  #my $newuL = $outdir . $lib . "_Merged_final.fastq";
+
+  my %new = ('1' => $new1, '2' => $new2, "u2" => $newuS );
+  my %reads = %{$reads};
+
+  foreach my $type (keys %reads) {
+    if ($type eq '1' || $type eq '2') {
+      open(OUT, ">$new{$type}");
+      open(IN, "<$reads{$type}");
+      while(<IN>) {
+	chomp(my $line = $_);
+	my @line =split (/\t+/, $line);
+	if (scalar(@line) == 1) {
+	  if ($line[0] =~ m/^@($InID\S+)\/[1|2]$/) {
+	    my $id = $1;
+	    my $seq = <IN>; my $qualid = <IN>; my $qual = <IN>;
+	    unless($junk{$id}){
+	      print OUT $line, "\n", $seq,$qualid,$qual;
+	    }
+	  }
+	}	    
+      }
+      close(IN); close(OUT);
+    }
+
+    
+    if ($type eq 'u2') {
+
+      open(OUT, ">$new{$type}");
+      open(IN, "<$reads{$type}");
+      while(<IN>) {
+	chomp(my $line = $_);
+	my @line =split (/\t+/, $line);
+	if (scalar(@line) == 1) {
+	  if ($line[0] =~ m/^@($InID\S+)\/([1|2])$/) {
+	    my $id = $1;
+	    my $fix = $2;
+	    my $seq = <IN>; my $qualid = <IN>; my $qual = <IN>;
+	    unless($junk{$id}){
+	      print OUT "@", $id , "/F", "\n", $seq,$qualid,$qual if ($fix == 1);
+	      print OUT "@", $id , "/R", "\n", $seq,$qualid,$qual if ($fix == 2);
+            }
+	  }
+	}	    
+      }
+      close(IN); close(OUT);
+    }  
+  }
+}
+
+
+
+
+##########################cleanPE done here####################################
+
+
+sub filter {
+  die(qq/
+
+RADTools filter [options] 
+
+options:
+
+-a     DIR     A folder with raw reads 
+               if PE: AAA_R1.fq, AAA_R2.fq, BBB_R1.fq, BBB_R2.fq...
+               if SE: AAA_R1.fq, BBB_R1.fq...
+
+-1     CHAR    RE recognition sequence for P1: required.  
+               for example sphi cuts between the second G and C for 
+               GCATGC. The you should give CATGC here
+
+-2     CHAR    RE recognition sequence for P2: required for ddRAD; 
+               dont use this option for single RAD.                 
+               for example ecoRI is GAATTC it cuts between the G and A.
+               The you should give AATTC here
+               
+               Note: for PE sdRAD use 0 here. 
+
+-m     INT     Maximum mismatches allowed in RE recognition sequence [1]
+
+-p             Paired-end data? if no then do not use -p [null]. 
+ 
+
+\n\n/) unless (@ARGV);
+  
+  
+  my %opts = (a=>undef, 1=>undef, 2=>undef, m=>1);
+  getopts('a:1:2:m:p', \%opts);
+  
+  
+  my $dir;
+  
+  if ($opts{a} =~ m/\/$/ ){
+    $dir = $opts{a}; 
+  }
+  else {
+    $dir = $opts{a} . "/";
+  }
+  
+  my $outdir = $dir . "filtered_raw_reads";
+  mkdir  $outdir unless -e $outdir;
+  my $resdir = $outdir . "/"; 
+  
+  my @file = <$dir*_R1.fq>;
+  
+  my $p1 = $opts{1};
+  my $p2 = $opts{2} if $opts{2};
+  my $len_p1 = length $p1;
+  my $len_p2 = length $p2 if $opts{2};
+  
+  my $Mmatch = $opts{m};
+  
+  foreach my $read1 (@file) {
+    my $read2 = $read1 if $opts{2}; 
+    $read2 =~ s/_R1.fq/_R2.fq/ if $opts{2};  
+    my $lib = $1 if basename($read1) =~ m/(\S+)_R1.fq/;
+    
+    #filter read 1
+    
+    unless ($opts{p}) {      
+    my $r1 = filter1 ($read1, $lib, $resdir, $p1, "R1", $Mmatch, $len_p1, 'se');	
+    my $final = $resdir . $lib . "_R1.fq";
+    system ("mv $r1 $final");
+    }
+    #filter read 2 if PE reads
+    if ($opts{p}) {
+      my $r1 = filter1 ($read1, $lib, $resdir, $p1, "R1", $Mmatch, $len_p1, 'pe');
+      my $r2;
+      if ($p2 ne "0") {
+	$r2 = filter1 ($read2, $lib, $resdir, $p2, "R2", $Mmatch, $len_p2, 'pe');
+      }
+      else {
+	$r2 = $read2;
+      }
+      
+      pairup ($r1, $r2, $lib, $resdir, $len_p1, $len_p2);
+    }
+  }
+}
+  
+
+sub filter1 {
+  my ($read, $lib, $resdir, $p, $suffix, $m, $len_p1, $suf) = @_;
+  
+  my @re = split //,$p;
+  my $len = scalar (@re);
+
+  my $new = $resdir . $lib . "_filtered_" . $suffix . ".fq";
+ 
+  open (R1, "<", $read);
+  open (O, ">", $new);
+  
+
+  while (<R1>) {
+    chomp (my $line = $_);
+    if ($line =~ m/^@\S+/) {
+      chomp (my $seq = <R1>);
+      chomp (my $q = <R1>);
+      chomp (my $qual = <R1>);
+
+      my $first = substr($seq, 0, $len);
+      my @start = split //,$first;
+      
+      my $d = 0;
+      for (my $i = 0; $i < $len; $i++) {
+	$d++ if $re[$i] ne $start[$i]; 
+      }
+      
+      if ( $d <= $m ) {
+        if ($suf eq 'pe') {  
+       
+	print O $line, "\n";
+	print O $seq, "\n";
+	print O $q, "\n";
+	print O $qual, "\n";
+       }
+       if ($suf eq 'se') {  
+        print O $line, "\n";
+	print O substr ($seq, $len), "\n";
+	print O $q, "\n";
+	print O substr ($qual, $len), "\n";
+       }
+      }
+    }
+  }
+  close R1; close O;
+  return ($new);
+} 
+ 
+ 
+sub pairup {
+  my ($read1, $read2, $lib, $resdir, $p1, $p2) = @_;
+  
+  my $new1 = $resdir . $lib . "_R1.fq";
+  my $new2 = $resdir . $lib . "_R2.fq";
+  
+  my %read;
+  open (IN1, "<", $read1);
+  while (<IN1>) {
+    chomp(my $line = $_);
+    if ($line =~ m/^(@\S+)\/1$/) {
+      my $id = $1; 
+      $read{$id}++;
+    }
+  }
+  close IN1;
+  
+  open (IN2, "<", $read2);
+  while (<IN2>) {
+    chomp(my $line = $_);
+    if ($line =~ m/^(@\S+)\/2$/) {
+      my $id = $1; 
+      $read{$id}++;
+    }
+  }
+  close IN2;
+ 
+  lit ($read1, $new1, \%read, $p1);
+  lit ($read2, $new2, \%read, $p2);
+  
+  unlink ($read1, $read2);
+}
+
+sub lit {
+  my ($old, $new, $read, $cut) = @_;
+  my %read = %{$read};
+  
+  open (IN, "<", $old);
+  open (OUT, ">", $new);
+  
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ m/^(@\S+)\/[1|2]$/) {
+      my $id = $1;
+      if($read{$id} == 2 ) {
+	chomp (my $seq = <IN>);
+	chomp (my $q = <IN>);
+	chomp (my $qual = <IN>);
+	
+	print OUT $line, "\n";
+	print OUT substr ($seq, $cut), "\n";
+	print OUT $q, "\n";
+	print OUT substr ($qual, $cut), "\n";
+	
+      } 
+    }    
+  }
+  close IN;
+  close OUT;
+}
+
+
+
+sub remove_dup {
+  my ($file1, $file2,$lib,$dir, $newdir) = @_;
+  
+  system ("super_deduper -1 $file1 -2 $file2 -p $dir" . "$lib -s 5 -l 10");
+  system ("mv $file1 $file2 $newdir");
+  my $newfile1 = $dir . $lib . "_nodup_PE1.fastq";
+  my $newfile2 = $dir . $lib . "_nodup_PE2.fastq";
+  system ("mv $newfile1 $file1");
+  system ("mv $newfile2 $file2");
+  return ($file1, $file2);
+}
